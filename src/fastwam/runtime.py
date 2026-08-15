@@ -158,6 +158,91 @@ def create_fastwam(
     )
 
 
+def create_dexjoco_dual_action_fastwam(
+    model_id: str,
+    tokenizer_model_id: str,
+    video_dit_config,
+    action_dit_config,
+    hand_dit_config,
+    tokenizer_max_len: int = 512,
+    load_text_encoder: bool = True,
+    proprio_dim: int = 23,
+    action_dit_pretrained_path: str | None = None,
+    skip_dit_load_from_pretrain: bool = False,
+    video_scheduler=None,
+    action_scheduler=None,
+    loss=None,
+    mot_checkpoint_mixed_attn: bool = True,
+    redirect_common_files: bool = True,
+    model_dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+):
+    from .models.wan22.dexjoco_dual_action import DexJoCoDualActionFastWAM
+
+    configs = {
+        "video_dit_config": video_dit_config,
+        "action_dit_config": action_dit_config,
+        "hand_dit_config": hand_dit_config,
+    }
+    for name, config in configs.items():
+        if isinstance(config, DictConfig):
+            config = OmegaConf.to_container(config, resolve=True)
+            configs[name] = config
+        if not isinstance(config, dict):
+            raise ValueError(f"`{name}` must resolve to a dict, got {type(config)}")
+
+    mappings = {
+        "video_scheduler": video_scheduler,
+        "action_scheduler": action_scheduler,
+        "loss": loss,
+    }
+    for name, mapping in mappings.items():
+        if isinstance(mapping, DictConfig):
+            mapping = OmegaConf.to_container(mapping, resolve=True)
+            mappings[name] = mapping
+        if mapping is None:
+            mapping = {}
+            mappings[name] = mapping
+        if not isinstance(mapping, dict):
+            raise ValueError(f"`{name}` must be dict-like, got {type(mapping)}")
+
+    action_scheduler = mappings["action_scheduler"]
+    required_scheduler_keys = {"train_shift", "infer_shift", "num_train_timesteps"}
+    missing_keys = required_scheduler_keys - set(action_scheduler)
+    if missing_keys:
+        raise ValueError(
+            f"`action_scheduler` missing required keys: {sorted(missing_keys)}. "
+            "Expected keys: train_shift, infer_shift, num_train_timesteps."
+        )
+
+    video_scheduler = mappings["video_scheduler"]
+    loss = mappings["loss"]
+    return DexJoCoDualActionFastWAM.from_wan22_pretrained(
+        device=device,
+        torch_dtype=model_dtype,
+        model_id=model_id,
+        tokenizer_model_id=tokenizer_model_id,
+        tokenizer_max_len=int(tokenizer_max_len),
+        load_text_encoder=bool(load_text_encoder),
+        proprio_dim=int(proprio_dim),
+        redirect_common_files=bool(redirect_common_files),
+        video_dit_config=configs["video_dit_config"],
+        action_dit_config=configs["action_dit_config"],
+        hand_dit_config=configs["hand_dit_config"],
+        action_dit_pretrained_path=action_dit_pretrained_path,
+        skip_dit_load_from_pretrain=bool(skip_dit_load_from_pretrain),
+        mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn),
+        video_train_shift=float(video_scheduler.get("train_shift", 5.0)),
+        video_infer_shift=float(video_scheduler.get("infer_shift", 5.0)),
+        video_num_train_timesteps=int(video_scheduler.get("num_train_timesteps", 1000)),
+        action_train_shift=float(action_scheduler["train_shift"]),
+        action_infer_shift=float(action_scheduler["infer_shift"]),
+        action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
+        loss_lambda_video=float(loss.get("lambda_video", 1.0)),
+        loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+    )
+
+
 def create_fastwam_joint(
     model_id: str,
     tokenizer_model_id: str,

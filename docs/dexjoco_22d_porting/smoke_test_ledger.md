@@ -82,3 +82,31 @@
 - 风险：持久六任务数据和 production statistics 尚未就绪；真实 T5 cache 尚未生成；30 FPS 数据到 50 Hz simulator 的 runtime 连接仍待后续确认。
 - 门槛：补齐 `click_mouse`/`pinch_tongs`，无 episode limit 生成并保存 production `dataset_stats.json`，生成真实 text embeddings；本阶段提交完成后需获得下一阶段明确授权。
 - 计划 commit message：`feat(data): add DexJoCo 22d action pipeline`
+
+## Phase 2 - 2026-08-15
+
+阶段目标：验证 DexJoCo Video/Arm/Hand 三 expert MoT、22D action diffusion/loss、23D proprio 和联合 attention 方向。阶段边界是不加载完整 checkpoint、不实现迁移/optimizer 分组、不运行完整 pytest、训练或正式推理。
+
+| ID | 检查 | 范围/方法 | 结果 | 证据或限制 |
+| --- | --- | --- | --- | --- |
+| P2-01 | 阶段 Git 基线 | 两仓库 status/branch/HEAD；读取全部项目记录 | PASS | FastWAM `main@8409c0fe...` 干净；DexJoCo `main@8d23b0fa...` 两个用户修改保持原样。 |
+| P2-02 | 三 expert 实例化 | 1 层真实 `WanVideoDiT` + 两个 1 层真实 `ActionDiT` + `MoT` | PASS | `expert_order=('video','action','hand')`；Arm=6D、Hand=16D；两者 backbone key/shape 完全一致。 |
+| P2-03 | 完整 forward | tiny CPU `training_loss(..., return_outputs=True)` | PASS | loss 有限；Arm `[1,4,6]`、Hand `[1,4,16]`、拼接 `[1,4,22]`。 |
+| P2-04 | 完整 action 契约 | `[1,4,22]` 输入及错误维度 fail-fast 代码路径 | PASS | `split_action()` 固定 `:6` / `6:22`，输入末维非 22 直接报错。 |
+| P2-05 | 单次 diffusion sample | counting scheduler 包装真实 action scheduler | PASS | `sample_training_t` 1 次，`add_noise` 1 次且输入 shape `[1,4,22]`。 |
+| P2-06 | Attention mask shape | 8 video + 4 Arm + 4 Hand tokens | PASS | 联合 mask `[16,16]`。 |
+| P2-07 | Attention 方向 | 对 mask 三个 block 逐项断言 | PASS | Video->Arm/Hand 全 false；Arm/Hand->完整 Video 全 true；Arm/Hand 联合 block 全 true。 |
+| P2-08 | 23D proprio encoder | tiny model 参数检查和一次 forward | PASS | `in_features=23` 且参数 `requires_grad=true`，proprio token 加入三个 expert 共用 context。 |
+| P2-09 | Cache fail-fast | 调用 DexJoCo `infer_action()` | EXPECTED FAIL | warning + `NotImplementedError`；现有 cache 只处理 `action` expert，禁止静默忽略 Hand。 |
+| P2-10 | 原 FastWAM 兼容 | tiny 原 `FastWAM` 两 expert / 7D ActionDiT 实例化 | PASS | `expert_order=('video','action')`、action dim=7；原类和配置未修改。 |
+| P2-11 | Hydra 配置 | compose `model=dexjoco_dual_action data=dexjoco_6task_2cam` | PASS | runtime target 和 22/6/16/23D 配置均解析正确。 |
+| P2-12 | 聚焦语法检查 | 新模型/runtime/smoke `compileall`、`git diff --check` | PASS | 编译和 whitespace 检查通过。 |
+| P2-13 | 完整 checkpoint/5B forward | 未运行 | NOT RUN | 正式 checkpoint 迁移被 Phase 2 明确排除，tiny smoke 不下载/加载 5B 权重。 |
+| P2-14 | optimizer/训练/完整 pytest | 未运行 | NOT RUN | 超出 Phase 2 边界。 |
+| P2-15 | 正式 inference/simulator | 未运行 | NOT RUN | 双 expert cache/sampler 尚未实现，simulator 不属于本阶段。 |
+
+### Phase 2 风险和下一阶段门槛
+
+- 风险：Hand backbone 尚未 remap；新 projection 初始化和迁移报告尚未落地；DexJoCo cache/joint inference 显式禁用；tiny CPU 模型不覆盖完整 5B 显存和分布式行为。
+- 门槛：实现并审计正式 checkpoint key remap/shape 报告，保持 Arm/Hand/proprio 新 projection 规则；另行设计能表达 Arm/Hand 交互的 cache/sampler；本阶段提交后需获得下一阶段明确授权。
+- 计划 commit message：`feat(model): add dual action experts for DexJoCo`

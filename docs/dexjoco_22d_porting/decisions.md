@@ -92,3 +92,34 @@
 - 决策：本阶段只运行每任务 1 episode 的 smoke statistics，文件留在 `/tmp` 且不能由默认 processor 加载。
 - 理由：本机持久数据根缺 `click_mouse` 和 `pinch_tongs`；为 shape/video smoke 下载的官方 `file-000` 只覆盖最少文件，不等于完整持久训练集。
 - 后续条件：补齐六任务后，使用无 `--max-episodes-per-task` 的正式命令生成训练输出目录中的 `dataset_stats.json`。
+
+## D-0013：DexJoCo 使用 `video,action,hand` 三 expert MoT
+
+- 日期：2026-08-15
+- 状态：Accepted
+- 决策：新增 `DexJoCoDualActionFastWAM`；Arm 继续使用 expert 名 `action` 和 6D `ActionDiT`，Hand 使用 expert 名 `hand` 和 16D `ActionDiT`。
+- 理由：`MoT.forward()` 已按 `expert_order` 泛化，不需要复制 Transformer 或修改原两 expert 路径；保留 `action` 名称为后续旧 checkpoint key remap 提供稳定目标。
+- 边界：本阶段 Hand Transformer 随机初始化；旧 Action Expert 到 Hand backbone 的正式 remap 延后处理。
+
+## D-0014：Arm/Hand 共享完整 22D diffusion sample 和单一 action loss
+
+- 日期：2026-08-15
+- 状态：Accepted
+- 决策：对 `[B,T,22]` 只生成一次 noise、采样一次 timestep 并调用一次 scheduler，之后拆分 6D/16D；预测拼接后对完整 22D 执行一次原 FastWAM MSE reduction。
+- 理由：分别对 6D/16D mean 后相加会把 Arm 与 Hand 各赋相同总权重，改变原来逐 action dimension 平均的 objective。
+- 影响：两个 expert 始终共享 timestep、scheduler、text/proprio conditioning 和 padding mask。
+
+## D-0015：双 Action Expert mask 保持 Video 单向因果边界
+
+- 日期：2026-08-15
+- 状态：Accepted
+- 决策：Video query 只读现有 video mask；Arm/Hand query 均读取所有 Video、Arm 和 Hand keys。
+- 影响：Arm/Hand 可以双向交互并读取完整 Video tokens；Video 不读任何动作 token，world objective 的因果方向不变。
+
+## D-0016：Phase 2 显式禁用 DexJoCo video KV cache 推理
+
+- 日期：2026-08-15
+- 状态：Accepted
+- 决策：设置 `supports_video_kv_cache=False`，并让 DexJoCo cache/inference 入口输出 warning 后抛出 `NotImplementedError`。
+- 证据：现有 `MoT.forward_action_with_video_cache()` 只构造 `cached video + action` K/V 和 action queries，没有 Hand K/V/query，无法保持 Arm/Hand 双向交互。
+- 后续条件：只有在 cache 同时更新 Arm/Hand 且 sampler 分配完整 22D latent 后才能启用。
