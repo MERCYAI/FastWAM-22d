@@ -253,3 +253,34 @@
 - 风险：tiny CPU 模型不覆盖 bf16/ZeRO2/4 GPU 或完整 7B trainable graph；validation diffusion loss 仍有 timestep/noise 随机波动。
 - 门槛：从干净监控实现 commit 生成 90 episodes/task production statistics、六 prompt T5 cache；先实测一个 full-model step 的显存/吞吐，再启动唯一一次有限预算正式 run。
 - 计划 commit message：`feat(train): add DexJoCo TensorBoard monitoring`
+
+## Phase 7 formal run - 2026-08-16
+
+阶段目标：基于已提交监控实现生成 production statistics 和正式 T5 cache，完成一次有限预算 full-model joint post-training，保存可恢复 checkpoint，并用 TensorBoard event 生成工程收敛摘要。正式训练是实验执行，不是测试；未运行 simulator 或 `rand_full` 评测。
+
+| ID | 检查 | 范围/方法 | 结果 | 证据或限制 |
+| --- | --- | --- | --- | --- |
+| P7-F01 | 干净代码基线 | 正式 run Git metadata | PASS | `fastwam22d-train@98c708c7e41e48e7b31c2ccf1bb388b2e23641b0`；该 hash 是 Phase 7 监控实现 commit。 |
+| P7-F02 | Production statistics | 六任务 `rand_obj` training subset、90 episodes/task | PASS | schema v1、production=true、action=22、state=23、540 episodes/197,528 transitions；60 validation episodes/21,465 transitions 未参与；SHA256 `4b08421c...a32e5f`。 |
+| P7-F03 | Statistics 数值 | JSON mean/std/floor audit | PASS | action/state 全 finite；`std_floor=1e-6`，两者 floor-applied dimensions 均为空。 |
+| P7-F04 | T5 cache | `scripts/precompute_text_embeds.py`、六任务 prompt | PASS | 6 个 `[128,4096]` bf16 cache；aggregate SHA256 `31aa571e...d8de8c`；训练进程不加载 T5。 |
+| P7-F05 | 冻结/optimizer 范围 | 启动日志参数组审计 | PASS | T5 out-of-graph、VAE frozen/eval；trainable 为 action-new 145,430、Arm/Hand backbone 2,041,741,312、Video 4,999,787,712，共 7,041,674,454。 |
+| P7-F06 | Selective checkpoint | 12 GB pretrained 加载报告 | PASS | loaded=1,645、copied-to-hand=820、skipped-policy/new=10/10，其余类别=0；report SHA256 `85651652...c9a1`。 |
+| P7-F07 | Distributed preflight | 4-rank model-free collective、dataset lengths/hash | PASS | `NCCL_CUMEM_HOST_ENABLE=0` 后 world-size 4 collective 通过；train/val=197,528/21,465，各 rank stats hash 一致。 |
+| P7-F08 | 正式训练 | Attempt 7，4 GPU ZeRO-3 bf16，global batch 4 | PASS | 连续完成 20 optimizer steps，exit code 0；seed=42、cosine、warmup=1、grad-accum=1。 |
+| P7-F09 | TensorBoard | isolated `tensorboard_attempt7` event audit | PASS | 25 tags；20 train points、4 val points；全部 finite；LR 10:5:1；Video/Arm/Hand/action-new grad norms finite。 |
+| P7-F10 | Loss 数值 | 首末 train 和每 5-step validation | PASS | train total/video/action 从 `16.6813/0.3375/16.3438` 到 `1.0431/0.2053/0.8378`；最低观测 val total 为 step 15 的 `1.3584`。 |
+| P7-F11 | 收敛摘要 | window=5、min-points=15 | PASS/NOT CONVERGED | total/video/action/arm/hand 均 `decreasing`，下降 78.28/29.31/83.55/80.73/83.93%，NaN/Inf=0；仍在下降，未宣称 converged。 |
+| P7-F12 | Validation 风险 | steps 5/10/15/20 单样本 loss | OBSERVED | total `2.4384 -> 1.8374 -> 1.3584 -> 1.6485`；末点回升可能是随机波动或早期过拟合信号，4 点不足以下结论。 |
+| P7-F13 | Checkpoint 完整性 | final ZeRO-3 state manifest/files/hash | PASS | step 20；22/6/16/23D；四 rank model+optimizer shards、scheduler/config/stats/report/random states；约 81 GiB，aggregate SHA256 `e3b1c7de...41629`。 |
+| P7-F14 | Checkpoint 选择 | save policy 与 validation 对照 | PASS | `save_every=0` 只保存 final step 20；step 15 虽有最低观测 validation loss但无 checkpoint，因此选择唯一可恢复的 step 20，不称 best-val。 |
+| P7-F15 | 失败尝试审计 | Attempts 1-6 logs/metadata | RECORDED | 分别暴露 NCCL SHM、stats race、ZeRO-2 Adam OOM、ZeRO-3 wrapper/group-name/partition-grad 兼容问题；只有 Attempt 7 是正式成功产物。 |
+| P7-F16 | 大型产物 Git 边界 | `.gitignore` 和 precise stage | PASS | checkpoint、events、stats、cache、logs、summary、run metadata 均留在 ignored `runs/`，实验记录只提交三份文档。 |
+| P7-F17 | 完整测试/下游评测 | 未运行 | NOT RUN | 按阶段要求未运行完整 pytest；也未运行 simulator success 或 `rand_full` 泛化评测。 |
+
+### Phase 7 formal run 风险和停止点
+
+- 冻结 T5/VAE 减少 gradient、optimizer state 和 backward activation，但其余约 7.04B trainable parameters 仍需 ZeRO-3；冻结不会让模型定义或 checkpoint 自动缩小。
+- 正式日志出现 allocator cache-flush warnings，属于高显存压力和吞吐风险；20 steps 内没有非有限 loss/gradient。
+- 20-step loss 曲线仍在下降，只能证明训练链路工作并呈下降趋势，不能证明策略收敛或 DexJoCo 任务成功。
+- 计划 commit message：`docs: record DexJoCo joint post-training run`

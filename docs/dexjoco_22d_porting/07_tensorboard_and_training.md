@@ -35,6 +35,21 @@ writer 输出到 `${output_dir}/tensorboard`，按 `tensorboard.flush_every` 定
 
 Full DexJoCo 模型在各 rank 上先构造模块、再转换到配置指定的 bf16；`run_training()` 在模型实例化后、首个 distributed collective 前执行 Python GC 和 `torch.cuda.empty_cache()`，只释放 dtype 转换留下的非活跃 allocator cache。活跃 Video/Arm/Hand/VAE 参数、selective loading 结果和训练数学不受影响。这避免约 7.04B 参数构造期的临时 fp32 allocation 挤占 NCCL workspace。
 
+### 冻结策略和显存语义
+
+正式 run 没有全量训练架构中的每个模块。实际状态为：
+
+| 模块 | 初始化 | 训练状态 | 训练进程中的作用 |
+| --- | --- | --- | --- |
+| Video DiT | pretrained | trainable | video/world objective |
+| Arm/Action DiT backbone | pretrained | trainable | 6D Arm Expert |
+| Hand Transformer backbone | 从 pretrained Action Expert remap | trainable | 16D Hand Expert |
+| Arm/Hand projection、23D proprio encoder | random/new initialization | trainable | 新 DexJoCo action/state contract |
+| T5/text encoder | 不加载权重；使用离线 cache | frozen/out of graph | 每个 prompt 直接读取 `[128,4096]` bf16 embedding |
+| VAE | pretrained | frozen、eval | 只编码视频 latent |
+
+冻结会减少 gradient、optimizer state 和 backward activation，但不会自动减少模型定义或 checkpoint 的参数总量；仍参与 forward 的冻结模块也可能占用显存。T5 因使用 cache 完全不驻留训练图，VAE 权重仍需驻留做编码。optimizer 实际覆盖：`action_new=145,430`、`action_backbone=2,041,741,312`、`video_backbone=4,999,787,712`，合计 `7,041,674,454` 个 trainable parameters。因此冻结 T5/VAE 后训练负担确实下降，但其余约 7.04B trainable parameters 的 Adam states 仍使 ZeRO-2 在首步 OOM；正式 run 改用 ZeRO-3 分片参数、梯度和 optimizer state，未改变冻结/训练策略。
+
 ## Episode 划分和 Statistics 一致性
 
 正式数据根为 `/home/shared/ai/datasets/dexlewm/dexjoco`，包含六任务各 100 episodes，共 218,993 frames，数据组织符合 `rand_obj`。本阶段冻结以下策略：
@@ -139,9 +154,123 @@ git diff --check
 
 均 PASS。Phase 2 dual-action/legacy instantiate、Phase 4 optimizer/scheduler 和 Phase 5 单步 loss/checkpoint 数值保持原结果；未运行完整 pytest。
 
-## 正式 Statistics 和训练
+## 正式 Statistics
 
-第一笔监控实现提交时本节状态为 `PENDING`。production statistics、真实 T5 cache、full-model throughput probe、有限预算正式 run、最终/选定 checkpoint、hash 和 loss 摘要将在训练真正结束后补录，并由第二笔小型实验记录提交固化。在这些结果存在前，不声称 Phase 7 完成或模型已收敛。
+正式 statistics 使用 `/home/shared/ai/datasets/dexlewm/dexjoco` 的 `rand_obj` training subset；`rand_full` 未混入训练。六任务各 100 episodes，经 seed 42 的确定性 90/10 划分后，只读取 90 episodes/task：
+
+```bash
+conda run --no-capture-output -n fastwam python scripts/compute_dexjoco_stats.py \
+  --data-root /home/shared/ai/datasets/dexlewm/dexjoco \
+  --output /home/user/fastwam-22d/runs/dexjoco_phase7_rand_obj_20260815/dataset_stats.json \
+  --split train \
+  --split-seed 42 \
+  --val-set-proportion 0.1 \
+  --action-horizon 32
+```
+
+结果为 `fastwam.dexjoco.dataset_stats@1`、`production=true`、action 22D、proprio 23D；540 episodes/197,528 training transitions，validation 的 60 episodes/21,465 transitions 未参与统计。所有 mean/std finite，`std_floor=1e-6`，action/state 的 `std_floor_applied_dimensions` 均为空。文件同时位于 run root 和 checkpoint state，字节一致：
+
+```text
+/home/user/fastwam-22d/runs/dexjoco_phase7_rand_obj_20260815/dataset_stats.json
+SHA256 4b08421c418d7127f5c8f8e490e853791c095425dc657322dc21927f60a32e5f
+```
+
+六个正式 prompt 的 T5 cache 位于 `text_embeds_cache/dexjoco/`，共 6 个 `[128,4096]` bf16 文件，aggregate SHA256 为 `31aa571ea3e73786360131fcf91dc9edcae44f030f40617682f7a5a1dad8de8c`。训练过程没有实例化 T5。
+
+## 正式 Joint Post-training
+
+正式成功 run（Attempt 7）基于干净实现 commit `98c708c7e41e48e7b31c2ccf1bb388b2e23641b0`，于 2026-08-16 00:01:02 +08:00 完成。配置为 4 GPU、DeepSpeed ZeRO-3、bf16、每 GPU batch 1、global batch 4、gradient accumulation 1、seed 42、cosine scheduler、1 step warmup，共 20 optimizer steps；每 5 steps 做一次 loss-only validation，只保存最终 checkpoint。
+
+真实启动命令：
+
+```bash
+NCCL_CUMEM_HOST_ENABLE=0 \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+DEXJOCO_LEROBOT_ROOT=/home/shared/ai/datasets/dexlewm/dexjoco \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+conda run --no-capture-output -n fastwam accelerate launch \
+  --config_file scripts/accelerate_configs/accelerate_zero3_ds.yaml \
+  --num_processes 4 \
+  --main_process_port 29575 \
+  scripts/train.py \
+  task=dexjoco_joint_2cam224_1e-4 \
+  output_dir=/home/user/fastwam-22d/runs/dexjoco_phase7_rand_obj_20260815 \
+  data.train.pretrained_norm_stats=/home/user/fastwam-22d/runs/dexjoco_phase7_rand_obj_20260815/dataset_stats.json \
+  data.train.text_embedding_cache_dir=/home/user/fastwam-22d/runs/dexjoco_phase7_rand_obj_20260815/text_embeds_cache/dexjoco \
+  batch_size=1 num_workers=2 max_steps=20 log_every=1 eval_every=5 save_every=0 \
+  gradient_accumulation_steps=1 mixed_precision=bf16 tensorboard.flush_every=5 \
+  tensorboard.log_dir=/home/user/fastwam-22d/runs/dexjoco_phase7_rand_obj_20260815/tensorboard_attempt7
+```
+
+`NCCL_CUMEM_HOST_ENABLE=0` 是该节点的必要 preflight 条件：未设置时，四 rank 的无模型 collective 也会在 NCCL shared-memory allocation 失败。`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 用于减少 allocator fragmentation。两者都记录在 run metadata，不改变模型数学。
+
+Pretrained checkpoint 为 `/home/user/fastwam-22d/checkpoints/libero_uncond_2cam224.pt`，SHA256 `1000437cfcf55c000094f79a2600634c502bcb5b492476b94bf8509883a49579`。selective loader 结果为 loaded 1,645、copied-to-hand 820、skipped-policy 10、newly-initialized 10、skipped-shape/missing/unexpected 均为 0；报告 SHA256 `85651652ac241d780a860c58064cd536f0645a58480d1d150bf270bb4f74c9a1`。
+
+### Loss 和收敛摘要
+
+训练首末点：
+
+| Step | total | video/world | action 22D |
+| ---: | ---: | ---: | ---: |
+| 1 | 16.6813 | 0.3375 | 16.3438 |
+| 20 | 1.0431 | 0.2053 | 0.8378 |
+
+验证只含 4 个单样本 loss points：
+
+| Step | total | video/world | action 22D | arm diag | hand diag |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 5 | 2.4384 | 0.6421 | 1.7963 | 1.3448 | 1.9656 |
+| 10 | 1.8374 | 0.4006 | 1.4368 | 0.8467 | 1.6581 |
+| 15 | 1.3584 | 0.3108 | 1.0476 | 0.4345 | 1.2776 |
+| 20 | 1.6485 | 0.4089 | 1.2396 | 0.7188 | 1.4348 |
+
+以 window 5、min-points 15 分析 20 个训练点：
+
+| Loss | 首窗口 mean | 末窗口 mean | 相对下降 | 末窗口 CV | 状态 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| total | 6.30747 | 1.37002 | 78.28% | 0.1722 | decreasing |
+| video/world | 0.612897 | 0.433252 | 29.31% | 0.2928 | decreasing |
+| action 22D | 5.69457 | 0.936764 | 83.55% | 0.1389 | decreasing |
+| arm 6D diagnostic | 2.46835 | 0.475694 | 80.73% | 0.2940 | decreasing |
+| hand 16D diagnostic | 6.90441 | 1.10967 | 83.93% | 0.1196 | decreasing |
+
+五条曲线的 NaN/Inf 均为 0、最后有效 step 均为 20。它们仍在下降，不能标记为 converged。validation 从 step 5 改善到 step 15，step 20 回升；由于只有四个随机 diffusion 单样本点，这只是波动/早期过拟合风险信号，不足以证明过拟合。尚未运行 simulator success 或 `rand_full` 泛化评测。
+
+摘要文件：
+
+```text
+summaries/convergence.json SHA256 0b580f9147111d7dcb80d9390bf7e06f1fa2148463765eebbd62382f998a7fd4
+summaries/convergence.md   SHA256 0c308e412fded66c2ab8da07e7ec801ff128641993a031803897fb4efcc58220
+```
+
+### TensorBoard 和 Checkpoint
+
+正式 event 目录与访问命令：
+
+```bash
+python scripts/launch_dexjoco_tensorboard.py \
+  --logdir /home/user/fastwam-22d/runs/dexjoco_phase7_rand_obj_20260815/tensorboard_attempt7 \
+  --host 127.0.0.1 \
+  --port 6006
+```
+
+event 文件为 26,940 bytes，SHA256 `7d800390fbfcf75922eeb3211745e373530c8e14c40ec309de659d17773909df`；包含 25 个 scalar tags、20 个 finite train points、steps 5/10/15/20 的 4 个 finite validation points，三组 LR 比例始终为 10:5:1，Video/Arm/Hand/action-new grad norms 均 finite。
+
+权威 checkpoint：
+
+```text
+/home/user/fastwam-22d/runs/dexjoco_phase7_rand_obj_20260815/checkpoints/state/step_000020
+size 85,920,058,245 bytes (~81 GiB)
+aggregate SHA256 e3b1c7de732be2a8906f4690b7ebe7d87d5e99bddcb21720bd46c31a4f741629
+```
+
+aggregate hash 使用 checkpoint 根下 `find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum`。manifest 确认 global step 20、22/6/16/23D、四 rank model/optimizer shard、scheduler、random state、resolved config、production stats 和 selective report 均存在。ZeRO-3 下 `weights_checkpoint=null` 是设计行为，分片 state 是唯一可 resume 的权威 checkpoint。
+
+step 15 有最低的观测 validation loss，但本次 `save_every=0` 只保存最终 step 20，因此不能选择不存在的 step-15 checkpoint。正式选择 step 20 作为唯一可恢复 checkpoint，不宣称它是 best-validation checkpoint。
+
+### 尝试审计
+
+正式产物只来自 Attempt 7。之前六次均不是重复的成功训练：Attempt 1/2 在 0 step 暴露 NCCL workspace 和 statistics 并发发布问题；Attempt 3 的 ZeRO-2 在首次 Adam state 分配 OOM；Attempt 4/5 在 0 step 暴露 ZeRO-3 wrapper 和 optimizer group-name 兼容问题；Attempt 6 完成 1 step 后暴露 partition gradient norm 读取问题且未保存 checkpoint。各问题修复后才启动下一次，Attempt 7 单次连续完成 20 steps。
 
 ## 修改文件
 
@@ -163,10 +292,12 @@ git diff --check
 - `docs/dexjoco_22d_porting/smoke_test_ledger.md`
 - `docs/dexjoco_22d_porting/commit_index.md`
 
-## 已知风险和后续条件
+## 已知风险和停止点
 
-- tiny CPU smoke 不证明 7B trainable parameter 图在 bf16、ZeRO2、4 GPU 上的显存、通信、吞吐或稳定性。
-- validation loss 含 diffusion timestep/noise 随机性；短窗口波动不能直接解释为泛化变化或过拟合。
+- 20 steps 是有限预算正式实验，证明 full-model bf16/ZeRO-3 训练、监控和 checkpoint 链路可运行，但不证明 loss 已收敛或策略已获得任务成功率。
+- validation 只有四个随机 diffusion 单样本点；step 20 回升需要更稳定的 validation 和 simulator 指标确认，不能单独判为发散或过拟合。
+- 训练日志出现 ZeRO-3 allocator cache-flush warnings，未导致数值错误，但代表高显存压力和吞吐风险；延长训练前应做显存/性能优化。
 - `train/step_time` 是 trainer 可观测 wall time，不额外调用 `cuda.synchronize()`；避免监控本身增加每步 GPU barrier。
-- 正式 run 前必须生成 90 episodes/task 的 production statistics、六 prompt T5 cache，并用真实 12 GB selective checkpoint 做 full-model step。
-- Phase 7 最终必须等待正式 run 结束、checkpoint/event 落盘且摘要生成后，才能提交实验记录并停止。
+- 尚未运行 `rand_full` 泛化或六任务 simulator success 评测；loss 摘要只是工程诊断。
+- checkpoint、events、statistics、T5 cache、日志、summary 和 run metadata 位于被忽略的 `runs/`，不提交 Git。
+- Phase 7 实验记录 commit 后停止，不进入下一阶段或继续训练。
