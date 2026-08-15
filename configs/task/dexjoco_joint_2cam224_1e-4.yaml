@@ -1,0 +1,35 @@
+# @package _global_
+
+defaults:
+  - override /data: dexjoco_6task_2cam
+  - override /model: dexjoco_dual_action
+  - _self_
+
+# dataloading
+batch_size: 2
+num_workers: 4
+
+model:
+  selective_checkpoint_path: checkpoints/libero_uncond_2cam224.pt
+  selective_checkpoint_report_path: ${output_dir}/dexjoco_selective_load_report.json
+
+# scheduler and named optimizer groups
+lr_scheduler_type: "cosine"
+learning_rate: 1.0e-4
+optimizer_groups:
+  action_new:
+    lr: 1.0e-4
+  action_backbone:
+    lr: 5.0e-5
+  video_backbone:
+    lr: 1.0e-5
+num_epochs: 10
+max_steps: null
+log_every: 10
+save_every: 2000
+eval_every: 200
+
+# training
+gradient_accumulation_steps: 1
+weight_decay: 1.0e-2
+resume: null

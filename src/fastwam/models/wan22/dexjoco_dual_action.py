@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
 from typing import Any, Optional
 
 import torch
@@ -24,6 +26,11 @@ class DexJoCoDualActionFastWAM(FastWAM):
     HAND_ACTION_DIM = 16
     PROPRIO_DIM = 23
     EXPERT_ORDER = ("video", "action", "hand")
+    JOINT_OPTIMIZER_GROUP_NAMES = (
+        "action_new",
+        "action_backbone",
+        "video_backbone",
+    )
 
     def __init__(
         self,
@@ -268,6 +275,160 @@ class DexJoCoDualActionFastWAM(FastWAM):
             apply=apply,
             source_name=source_name,
         )
+
+    def configure_joint_post_training(self) -> None:
+        """Apply the DexJoCo joint post-training train/eval and freeze policy."""
+
+        if self.proprio_encoder is None:
+            raise ValueError("DexJoCo joint post-training requires a 23D proprio encoder.")
+
+        self.train()
+        self.requires_grad_(False)
+        trainable_modules = (
+            self.video_expert,
+            self.action_expert,
+            self.hand_expert,
+            self.proprio_encoder,
+        )
+        for module in trainable_modules:
+            module.train()
+            module.requires_grad_(True)
+
+        for module in (self.text_encoder, self.vae):
+            if module is not None:
+                module.eval()
+                module.requires_grad_(False)
+
+    def build_joint_post_training_parameter_groups(
+        self,
+        group_hyperparameters: Mapping[str, Mapping[str, float]],
+    ) -> list[dict[str, Any]]:
+        """Build complete, disjoint DexJoCo optimizer groups by module ownership."""
+
+        expected_names = set(self.JOINT_OPTIMIZER_GROUP_NAMES)
+        actual_names = set(group_hyperparameters)
+        if actual_names != expected_names:
+            raise ValueError(
+                "DexJoCo optimizer groups must be exactly "
+                f"{self.JOINT_OPTIMIZER_GROUP_NAMES}, got {sorted(actual_names)}."
+            )
+
+        options: dict[str, dict[str, float]] = {}
+        for group_name in self.JOINT_OPTIMIZER_GROUP_NAMES:
+            group_options = group_hyperparameters[group_name]
+            if "lr" not in group_options or "weight_decay" not in group_options:
+                raise ValueError(
+                    f"DexJoCo optimizer group `{group_name}` requires `lr` and `weight_decay`."
+                )
+            lr = float(group_options["lr"])
+            weight_decay = float(group_options["weight_decay"])
+            if not math.isfinite(lr) or lr <= 0:
+                raise ValueError(f"Optimizer group `{group_name}` LR must be finite and > 0, got {lr}.")
+            if not math.isfinite(weight_decay) or weight_decay < 0:
+                raise ValueError(
+                    f"Optimizer group `{group_name}` weight decay must be finite and >= 0, "
+                    f"got {weight_decay}."
+                )
+            options[group_name] = {"lr": lr, "weight_decay": weight_decay}
+
+        action_new_lr = options["action_new"]["lr"]
+        action_backbone_lr = options["action_backbone"]["lr"]
+        video_backbone_lr = options["video_backbone"]["lr"]
+        if not action_new_lr > action_backbone_lr >= video_backbone_lr:
+            raise ValueError(
+                "DexJoCo optimizer LR ordering must satisfy "
+                "action_new > action_backbone >= video_backbone, got "
+                f"{action_new_lr}, {action_backbone_lr}, {video_backbone_lr}."
+            )
+
+        named_groups: dict[str, list[tuple[str, torch.nn.Parameter]]] = {
+            group_name: [] for group_name in self.JOINT_OPTIMIZER_GROUP_NAMES
+        }
+
+        def add_module(group_name: str, prefix: str, module) -> None:
+            for local_name, parameter in module.named_parameters():
+                named_groups[group_name].append((f"{prefix}.{local_name}", parameter))
+
+        add_module("action_new", "action.action_encoder", self.action_expert.action_encoder)
+        add_module("action_new", "action.head", self.action_expert.head)
+        add_module("action_new", "hand.action_encoder", self.hand_expert.action_encoder)
+        add_module("action_new", "hand.head", self.hand_expert.head)
+        add_module("action_new", "proprio_encoder", self.proprio_encoder)
+
+        for expert_name, expert in (
+            ("action", self.action_expert),
+            ("hand", self.hand_expert),
+        ):
+            for local_name, parameter in expert.named_parameters():
+                if any(
+                    local_name.startswith(prefix)
+                    for prefix in ActionDiT.ACTION_BACKBONE_SKIP_PREFIXES
+                ):
+                    continue
+                named_groups["action_backbone"].append(
+                    (f"{expert_name}.{local_name}", parameter)
+                )
+        add_module("video_backbone", "video", self.video_expert)
+
+        model_parameter_names = {
+            id(parameter): name for name, parameter in self.named_parameters()
+        }
+        trainable_ids = {
+            id(parameter)
+            for parameter in self.parameters()
+            if parameter.requires_grad
+        }
+        assigned_ids: set[int] = set()
+        duplicate_names: list[str] = []
+        frozen_names: list[str] = []
+        for entries in named_groups.values():
+            for stable_name, parameter in entries:
+                parameter_id = id(parameter)
+                if parameter_id in assigned_ids:
+                    duplicate_names.append(stable_name)
+                assigned_ids.add(parameter_id)
+                if not parameter.requires_grad:
+                    frozen_names.append(stable_name)
+
+        if duplicate_names:
+            raise ValueError(
+                "DexJoCo optimizer parameter groups overlap: "
+                f"{sorted(duplicate_names)[:10]}."
+            )
+        if frozen_names:
+            raise ValueError(
+                "DexJoCo optimizer groups contain frozen parameters: "
+                f"{sorted(frozen_names)[:10]}."
+            )
+        if assigned_ids != trainable_ids:
+            missing_ids = trainable_ids - assigned_ids
+            extra_ids = assigned_ids - trainable_ids
+            missing_names = sorted(
+                model_parameter_names.get(parameter_id, f"<unknown:{parameter_id}>")
+                for parameter_id in missing_ids
+            )
+            extra_names = sorted(
+                model_parameter_names.get(parameter_id, f"<unknown:{parameter_id}>")
+                for parameter_id in extra_ids
+            )
+            raise ValueError(
+                "DexJoCo optimizer groups must cover every trainable parameter exactly once; "
+                f"missing={missing_names[:10]}, extra={extra_names[:10]}."
+            )
+
+        self.joint_optimizer_group_parameter_names = {
+            group_name: tuple(name for name, _ in named_groups[group_name])
+            for group_name in self.JOINT_OPTIMIZER_GROUP_NAMES
+        }
+        return [
+            {
+                "name": group_name,
+                "params": [parameter for _, parameter in named_groups[group_name]],
+                "lr": options[group_name]["lr"],
+                "weight_decay": options[group_name]["weight_decay"],
+            }
+            for group_name in self.JOINT_OPTIMIZER_GROUP_NAMES
+        ]
 
     def split_action(self, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if action.ndim != 3:

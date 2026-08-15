@@ -3,16 +3,23 @@ import json
 import inspect
 import os
 import re
-from math import ceil
+from collections.abc import Mapping
+from math import ceil, cos, pi
 from pathlib import Path
 import time
 
 import numpy as np
 import torch
 from accelerate import Accelerator
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from PIL import Image
-from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import (
+    ConstantLR,
+    CosineAnnealingLR,
+    LambdaLR,
+    LinearLR,
+    SequentialLR,
+)
 from torch.utils.data import DataLoader
 
 from .utils.fs import ensure_dir
@@ -23,6 +30,65 @@ from .utils.video_io import save_mp4
 from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
 
 logger = get_logger(__name__)
+
+
+def build_lr_scheduler(
+    optimizer,
+    scheduler_type,
+    total_train_steps: int,
+    warmup_steps: int = 0,
+    min_lr_ratio: float = 0.01,
+):
+    """Build a scheduler that preserves relative LRs across parameter groups."""
+
+    scheduler_type = str(scheduler_type).strip().lower()
+    total_train_steps = max(int(total_train_steps), 1)
+    warmup_steps = min(max(int(warmup_steps), 0), total_train_steps - 1)
+    remaining_steps = max(total_train_steps - warmup_steps, 1)
+
+    if scheduler_type == "cosine":
+        if len(optimizer.param_groups) == 1:
+            base_lr = float(optimizer.param_groups[0]["lr"])
+            main_scheduler = CosineAnnealingLR(
+                optimizer,
+                T_max=remaining_steps,
+                eta_min=base_lr * float(min_lr_ratio),
+            )
+        else:
+
+            def lr_factor(step: int) -> float:
+                progress = min(max(float(step) / remaining_steps, 0.0), 1.0)
+                return float(min_lr_ratio) + (1.0 - float(min_lr_ratio)) * 0.5 * (
+                    1.0 + cos(pi * progress)
+                )
+
+            main_scheduler = LambdaLR(optimizer, lr_lambda=lr_factor)
+    elif scheduler_type == "constant":
+        main_scheduler = ConstantLR(
+            optimizer,
+            factor=1.0,
+            total_iters=remaining_steps,
+        )
+    else:
+        raise ValueError(
+            f"Unsupported lr_scheduler_type: {scheduler_type}. "
+            "Expected one of: ['cosine', 'constant']."
+        )
+
+    if warmup_steps <= 0:
+        return main_scheduler
+
+    warmup_scheduler = LinearLR(
+        optimizer,
+        start_factor=1.0 / warmup_steps,
+        end_factor=1.0,
+        total_iters=warmup_steps,
+    )
+    return SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, main_scheduler],
+        milestones=[warmup_steps],
+    )
 
 
 class Wan22Trainer:
@@ -82,16 +148,7 @@ class Wan22Trainer:
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         # This keeps DiT (+ optional proprio encoder) as trainable when ZeRO builds optimizer state.
         self._apply_dit_only_train_mode(self.model)
-        trainable_params = list(self.model.dit.parameters())
-        proprio_encoder = getattr(self.model, "proprio_encoder", None)
-        if proprio_encoder is not None:
-            trainable_params.extend(list(proprio_encoder.parameters()))
-        self.optimizer = torch.optim.AdamW(
-            trainable_params,
-            lr=self.learning_rate,
-            weight_decay=self.weight_decay,
-            betas=(0.9, 0.95),
-        )
+        self.optimizer = self._build_optimizer()
         
         self.train_loader = self._build_loader(self.train_dataset, worker_init_fn=worker_init_fn)
         total_train_steps = self._estimate_total_train_steps()
@@ -217,39 +274,86 @@ class Wan22Trainer:
         )
         return max(opt_steps_per_epoch * self.num_epochs, 1)
 
-    def _build_scheduler(self, scheduler_type, total_train_steps: int, warmup_steps: int = 0):
-        scheduler_type = str(scheduler_type).strip().lower()
-        total_train_steps = max(int(total_train_steps), 1)
-        warmup_steps = min(max(int(warmup_steps), 0), total_train_steps - 1)
-
-        remaining_steps = max(total_train_steps - warmup_steps, 1)
-        if scheduler_type == "cosine":
-            main_scheduler = CosineAnnealingLR(
-                self.optimizer,
-                T_max=remaining_steps,
-                eta_min=self.learning_rate * 0.01,
-            )
-        elif scheduler_type == "constant":
-            main_scheduler = ConstantLR(self.optimizer, factor=1.0, total_iters=remaining_steps)
-        else:
-            raise ValueError(
-                f"Unsupported lr_scheduler_type: {scheduler_type}. "
-                "Expected one of: ['cosine', 'constant']."
-            )
-
-        if warmup_steps <= 0:
-            return main_scheduler
-
-        warmup_scheduler = LinearLR(
-            self.optimizer,
-            start_factor=1.0 / warmup_steps,
-            end_factor=1.0,
-            total_iters=warmup_steps,
+    def _build_optimizer(self):
+        parameter_group_builder = getattr(
+            self.model,
+            "build_joint_post_training_parameter_groups",
+            None,
         )
-        return SequentialLR(
+        optimizer_groups_cfg = self.cfg.get("optimizer_groups")
+        if callable(parameter_group_builder):
+            if optimizer_groups_cfg is None:
+                raise ValueError(
+                    "DexJoCo joint post-training requires the three named `optimizer_groups` "
+                    "in the training config."
+                )
+            if isinstance(optimizer_groups_cfg, DictConfig):
+                optimizer_groups_cfg = OmegaConf.to_container(
+                    optimizer_groups_cfg,
+                    resolve=True,
+                )
+            if not isinstance(optimizer_groups_cfg, Mapping):
+                raise TypeError(
+                    "`optimizer_groups` must resolve to a mapping, got "
+                    f"{type(optimizer_groups_cfg).__name__}."
+                )
+            group_hyperparameters = {}
+            for group_name, group_cfg in optimizer_groups_cfg.items():
+                if not isinstance(group_cfg, Mapping):
+                    raise TypeError(
+                        f"Optimizer group `{group_name}` must be a mapping, "
+                        f"got {type(group_cfg).__name__}."
+                    )
+                if "lr" not in group_cfg:
+                    raise ValueError(f"Optimizer group `{group_name}` is missing `lr`.")
+                group_hyperparameters[str(group_name)] = {
+                    "lr": float(group_cfg["lr"]),
+                    "weight_decay": float(group_cfg.get("weight_decay", self.weight_decay)),
+                }
+            parameter_groups = parameter_group_builder(group_hyperparameters)
+        else:
+            if optimizer_groups_cfg is not None:
+                raise ValueError(
+                    "Named `optimizer_groups` were configured for a model that does not "
+                    "provide a parameter-group builder."
+                )
+            trainable_params = list(self.model.dit.parameters())
+            proprio_encoder = getattr(self.model, "proprio_encoder", None)
+            if proprio_encoder is not None:
+                trainable_params.extend(list(proprio_encoder.parameters()))
+            parameter_groups = [
+                {
+                    "name": "default",
+                    "params": trainable_params,
+                    "lr": self.learning_rate,
+                    "weight_decay": self.weight_decay,
+                }
+            ]
+
+        optimizer = torch.optim.AdamW(
+            parameter_groups,
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay,
+            betas=(0.9, 0.95),
+        )
+        for index, group in enumerate(optimizer.param_groups):
+            parameters = list(group["params"])
+            logger.info(
+                "Optimizer group: name=%s lr=%.6g weight_decay=%.6g tensors=%d parameters=%d",
+                group.get("name", f"group_{index}"),
+                float(group["lr"]),
+                float(group["weight_decay"]),
+                len(parameters),
+                sum(parameter.numel() for parameter in parameters),
+            )
+        return optimizer
+
+    def _build_scheduler(self, scheduler_type, total_train_steps: int, warmup_steps: int = 0):
+        return build_lr_scheduler(
             self.optimizer,
-            schedulers=[warmup_scheduler, main_scheduler],
-            milestones=[warmup_steps],
+            scheduler_type=scheduler_type,
+            total_train_steps=total_train_steps,
+            warmup_steps=warmup_steps,
         )
     
     def _estimate_eta(self):
@@ -285,6 +389,14 @@ class Wan22Trainer:
 
     @staticmethod
     def _apply_dit_only_train_mode(model):
+        configure_joint_post_training = getattr(
+            model,
+            "configure_joint_post_training",
+            None,
+        )
+        if callable(configure_joint_post_training):
+            configure_joint_post_training()
+            return
         model.eval()
         model.requires_grad_(False)
         model.dit.train()
@@ -693,7 +805,11 @@ class Wan22Trainer:
                     grad_norm_tensor = torch.tensor(grad_norm, device=loss.device, dtype=torch.float32)
                     global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
 
-                    current_lr = float(self.optimizer.param_groups[0]["lr"])
+                    current_lrs = {
+                        str(group.get("name", f"group_{index}")): float(group["lr"])
+                        for index, group in enumerate(self.optimizer.param_groups)
+                    }
+                    current_lr = next(iter(current_lrs.values()))
 
                     if self.log_every > 0 and self.global_step % self.log_every == 0 and self.accelerator.is_main_process:
                         eta_str, steps_per_sec = self._estimate_eta()
@@ -706,8 +822,11 @@ class Wan22Trainer:
                         if global_loss_metrics:
                             detail_str = " ".join([f"{k}={v:.4f}" for k, v in sorted(global_loss_metrics.items())])
                             description += detail_str + " "
-                        description += "lr=%.2e speed=%.2f step/s, %.2f samples/s eta=%s" % (
-                            current_lr,
+                        lr_description = ",".join(
+                            f"{name}:{lr:.2e}" for name, lr in current_lrs.items()
+                        )
+                        description += "lr=[%s] speed=%.2f step/s, %.2f samples/s eta=%s" % (
+                            lr_description,
                             steps_per_sec,
                             steps_per_sec * self.batch_size * self.accelerator.num_processes,
                             eta_str,
@@ -721,6 +840,8 @@ class Wan22Trainer:
                             "performance/steps_per_sec": steps_per_sec,
                             "performance/samples_per_sec": steps_per_sec * self.batch_size * self.accelerator.num_processes,
                         }
+                        for group_name, group_lr in current_lrs.items():
+                            wandb_payload[f"train/lr/{group_name}"] = group_lr
                         for key, value in global_loss_metrics.items():
                             wandb_payload[f"train/{key}"] = value
                         self._wandb_log(wandb_payload)

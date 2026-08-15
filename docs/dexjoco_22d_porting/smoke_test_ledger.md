@@ -138,3 +138,32 @@
 - 风险：没有真实旧 FastWAM checkpoint，因此本阶段只确认 synthetic tensor 内容和正式 5B config 的 meta key/shape 图；真实权重的 key/count 仍需在获得 checkpoint 后用审计 CLI 验证。
 - 门槛：真实报告必须满足 `missing_in_checkpoint=0`、`skipped_shape=0`，并人工复核 `unexpected_in_checkpoint`；之后才能设计 optimizer 分组或启动训练。
 - 计划 commit message：`feat(checkpoint): add selective DexJoCo weight loading`
+
+## Phase 4 - 2026-08-15
+
+阶段目标：验证 DexJoCo joint post-training 的训练/冻结状态、互斥且完备的命名 optimizer groups，以及保持组间 LR 比例的 scheduler。阶段边界是不执行 backward、正式训练、完整 pytest、分布式/DeepSpeed optimizer-state 恢复或 simulator。
+
+| ID | 检查 | 范围/方法 | 结果 | 证据或限制 |
+| --- | --- | --- | --- | --- |
+| P4-01 | 阶段 Git 基线 | 两仓库 status/branch/HEAD；读取全部项目记录 | PASS | FastWAM `main@9854c306...` 干净；DexJoCo `main@8d23b0fa...` 两个用户修改保持原样；Phase 3 hash 已回填。 |
+| P4-02 | 真实 checkpoint dry-run | 正式 5B meta target + `checkpoints/libero_uncond_2cam224.pt`，`apply=false` | PASS | loaded=1645、copied_to_hand=820、skipped_shape=0、skipped_policy=10、missing=0、unexpected=0、newly_initialized=10；未开始训练。 |
+| P4-03 | Tiny optimizer groups | 1 层真实 Video/Arm/Hand expert + 23D proprio | PASS | `action_new` 10 tensors/1,894 params；`action_backbone` 74/26,928；`video_backbone` 42/13,732。 |
+| P4-04 | 正式结构 group 审计 | 正式 5B 配置在 meta device 构造 modules/optimizer | PASS | `action_new` 10 tensors/145,430 params；`action_backbone` 1,640/2,041,741,312；`video_backbone` 825/4,999,787,712。 |
+| P4-05 | 互斥和覆盖 | 比较所有 optimizer parameter object id 与全部 `requires_grad=True` parameter id | PASS | 每个 trainable parameter 恰好出现一次；overlap=0；frozen-in-optimizer=0。 |
+| P4-06 | T5/VAE freeze | 检查 `requires_grad`、module mode，并模拟 `model.train()` 后重用 trainer freeze 入口 | PASS | T5/VAE 全部 `requires_grad=False` 且 `training=False`；Video/Arm/Hand/proprio 为 trainable/train。 |
+| P4-07 | LR policy | 配置值、启动组属性和错误顺序 fail-fast | PASS | base LR=`1e-4,5e-5,1e-5`，weight decay 均 `0.01`；满足 `action_new > action_backbone >= video_backbone`；无效顺序抛错。 |
+| P4-08 | Scheduler 比例 | cosine scheduler 含 2-step warmup，optimizer/scheduler 前进一步 | PASS | stepped LR=`7.5e-5,3.75e-5,7.5e-6`，三组 common factor=`0.75`，顺序/比例保持。 |
+| P4-09 | 代表参数归属 | 按 parameter object 查 optimizer group | PASS | Arm/Hand encoder/head 与 proprio -> `action_new`；Arm/Hand blocks -> `action_backbone`；Video block -> `video_backbone`。 |
+| P4-10 | 原 FastWAM 兼容 | 原 tiny 7D FastWAM 构造 legacy optimizer | PASS | 单一 `default` AdamW group；LIBERO Hydra 配置 `optimizer_groups=null`、action_dim=7。 |
+| P4-11 | Phase 2/3 回归 | dual-action forward smoke、selective synthetic smoke | PASS | forward action `[1,4,22]`、mask `[16,16]`；selective 成功/故障分类与 tensor equality/fail-fast 均通过。 |
+| P4-12 | Hydra/absolute action | compose DexJoCo joint task config | PASS | 三组 LR、真实 checkpoint 相对路径、6/16/23D 解析正确；`data.train.processor.delta_action_dim_mask=null`。 |
+| P4-13 | 语法/whitespace | `compileall`、`git diff --check` | PASS | Phase 4 Python 文件编译和 whitespace 检查通过。 |
+| P4-14 | 正式训练/backward/完整 pytest | 未运行 | NOT RUN | 超出 Phase 4 边界。 |
+| P4-15 | 分布式和 resume | 未运行 | NOT RUN | 未验证 DeepSpeed/ZeRO optimizer state、Accelerate 多 rank 或旧单组 state 到三组 state 的恢复。 |
+
+### Phase 4 风险和下一阶段门槛
+
+- 风险：正式参数计数来自 meta modules，证明 ownership graph 但不证明训练硬件上的显存、通信和吞吐；没有执行 backward、optimizer state 分配或 checkpoint resume。
+- 风险：当前 DexJoCo cached inference 仍按 Phase 2 fail-fast 禁用；六任务 production `dataset_stats.json` 仍未生成，不能启动正式训练。
+- 门槛：完整 training split statistics 就绪并通过 schema 校验；在目标分布式配置上做单步 forward/backward、optimizer/scheduler 和 save/resume smoke；确认双 Action Expert inference/cache 路径后再进入正式训练或仿真。
+- 计划 commit message：`feat(train): add DexJoCo parameter groups`
