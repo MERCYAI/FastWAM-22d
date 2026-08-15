@@ -1,3 +1,4 @@
+import gc
 import logging
 import os
 import inspect
@@ -421,7 +422,27 @@ def create_fastwam_idm(
 
 def build_datasets(data_cfg: DictConfig):
     train_ds = instantiate(data_cfg.train)
-    if data_cfg.get("val") is None:
+    validation_cfg = data_cfg.get("validation")
+    if data_cfg.get("val") is None and validation_cfg and validation_cfg.get("enabled", False):
+        train_stats_path = data_cfg.train.get("pretrained_norm_stats")
+        default_stats_path = os.path.join(misc.get_work_dir(), "dataset_stats.json")
+        pretrained_norm_stats = train_stats_path or default_stats_path
+        val_overrides = {
+            "is_training_set": False,
+            "val_set_proportion": float(validation_cfg.val_set_proportion),
+            "seed": int(validation_cfg.get("split_seed", 42)),
+            "pretrained_norm_stats": pretrained_norm_stats,
+        }
+        val_cfg = OmegaConf.merge(data_cfg.train, val_overrides)
+        logger.info(
+            "Building deterministic validation dataset with val_set_proportion=%.4f "
+            "seed=%d pretrained_norm_stats=%s",
+            val_overrides["val_set_proportion"],
+            val_overrides["seed"],
+            pretrained_norm_stats,
+        )
+        val_ds = instantiate(val_cfg)
+    elif data_cfg.get("val") is None:
         val_ds = train_ds
     else:
         train_stats_path = data_cfg.train.get("pretrained_norm_stats")
@@ -459,6 +480,22 @@ def run_training(cfg: DictConfig):
     mixed_precision = _normalize_mixed_precision(cfg.mixed_precision)
     model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
     model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
+    if torch.cuda.is_available() and str(model_device).startswith("cuda"):
+        # Large modules are constructed in the default dtype before being cast to
+        # the requested training dtype. Release those transient allocator blocks
+        # before the first distributed collective needs CUDA workspace.
+        gc.collect()
+        torch.cuda.empty_cache()
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        logger.info(
+            "Released transient CUDA allocator cache after model initialization on %s: "
+            "allocated=%d reserved=%d free=%d total=%d bytes.",
+            model_device,
+            torch.cuda.memory_allocated(),
+            torch.cuda.memory_reserved(),
+            free_bytes,
+            total_bytes,
+        )
     train_ds, val_ds = build_datasets(cfg.data)
 
     trainer = Wan22Trainer(

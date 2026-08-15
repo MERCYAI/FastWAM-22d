@@ -41,6 +41,12 @@ wandb:
   group: null
   mode: online
 
+# TensorBoard is opt-in so legacy FastWAM runs keep their current behavior.
+tensorboard:
+  enabled: false
+  log_dir: ${output_dir}/tensorboard
+  flush_every: 10
+
 hydra:
   job:
     chdir: false

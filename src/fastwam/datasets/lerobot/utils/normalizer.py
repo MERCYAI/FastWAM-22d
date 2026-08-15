@@ -1,14 +1,17 @@
-from typing import Literal, Dict, Annotated, Union, Any, List, Tuple, Optional
-import torch
-import json
-from collections import defaultdict
-import numpy as np
-from omegaconf import DictConfig, OmegaConf
 import hashlib
+import json
+import os
+import tempfile
+from collections import defaultdict
 from pathlib import Path
-from git import Repo
-from fastwam.utils.logging_config import get_logger
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 
+import numpy as np
+import torch
+from git import Repo
+from omegaconf import DictConfig, OmegaConf
+
+from fastwam.utils.logging_config import get_logger
 from fastwam.utils.pytorch_utils import dict_apply
 
 logger = get_logger(__name__)
@@ -132,7 +135,7 @@ class SingleFieldLinearNormalizer:
         x = (x - self.offset) / self.scale
         return x
 
-def save_dataset_stats_to_json(dataset_stats: dict, file_path: str):
+def save_dataset_stats_to_json(dataset_stats: dict, file_path: str | Path):
 
     def convert_tensor(obj):
         if isinstance(obj, torch.Tensor):
@@ -147,9 +150,26 @@ def save_dataset_stats_to_json(dataset_stats: dict, file_path: str):
             return str(obj)
     
     serializable_stats = convert_tensor(dataset_stats)
-    
-    with open(file_path, 'w', encoding='utf-8') as f:
-        json.dump(serializable_stats, f, ensure_ascii=False, indent=2)
+    output_path = Path(file_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            json.dump(serializable_stats, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, output_path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
 
 def load_dataset_stats_from_json(file_path: str, 
                                  try_convert_tensor: bool = True) -> Dict[str, Any]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import bisect
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,6 +55,40 @@ def _parse_episode_split(value: Any, available_indices: Sequence[int]) -> set[in
     if isinstance(value, (list, tuple)):
         return {int(index) for index in value}
     raise ValueError(f"Unsupported LeRobot v3 split declaration: {value!r}")
+
+
+DEXJOCO_EPISODE_SPLIT_POLICY = "per_task_seeded_shuffle_v1"
+
+
+def select_dexjoco_episode_indices(
+    available_indices: Sequence[int],
+    *,
+    task_name: str,
+    val_set_proportion: float,
+    is_training_set: bool,
+    seed: int,
+) -> list[int]:
+    """Select one deterministic, task-local train or validation episode subset."""
+
+    if not 0.0 <= float(val_set_proportion) < 1.0:
+        raise ValueError(
+            "DexJoCo `val_set_proportion` must be in [0, 1), got "
+            f"{val_set_proportion}."
+        )
+    indices = np.asarray([int(index) for index in available_indices], dtype=np.int64)
+    if indices.size == 0:
+        return []
+    if float(val_set_proportion) < 1e-6:
+        return indices.tolist()
+
+    task_digest = hashlib.sha256(task_name.encode("utf-8")).digest()
+    task_seed = int.from_bytes(task_digest[:8], byteorder="little", signed=False)
+    rng = np.random.default_rng(np.random.SeedSequence([int(seed), task_seed]))
+    shuffled = indices.copy()
+    rng.shuffle(shuffled)
+    split_index = int(len(shuffled) * (1.0 - float(val_set_proportion)))
+    selected = shuffled[:split_index] if is_training_set else shuffled[split_index:]
+    return selected.tolist()
 
 
 class DexJoCoV3TaskSource:
@@ -303,6 +338,8 @@ class DexJoCoV3Dataset(torch.utils.data.Dataset):
         self.obs_size = obs_size
         self.global_sample_stride = global_sample_stride
         self.is_training_set = is_training_set
+        self.val_set_proportion = float(val_set_proportion)
+        self.seed = int(seed)
         self.split = split
         self.task_names = tuple(task_names)
         self.processor: Optional[BaseProcessor] = None
@@ -316,16 +353,21 @@ class DexJoCoV3Dataset(torch.utils.data.Dataset):
         if fps_values != {30}:
             raise ValueError(f"DexJoCo tasks must all be 30 FPS, got {sorted(fps_values)}.")
 
-        rng = np.random.default_rng(seed)
         self.selected_episodes: list[tuple[DexJoCoV3TaskSource, DexJoCoEpisode]] = []
         for source in self.sources:
             episodes = list(source.episodes)
-            if val_set_proportion >= 1e-6:
-                indices = np.arange(len(episodes))
-                rng.shuffle(indices)
-                split_index = int(len(indices) * (1 - val_set_proportion))
-                selected = indices[:split_index] if is_training_set else indices[split_index:]
-                episodes = [episodes[index] for index in selected]
+            selected_indices = set(
+                select_dexjoco_episode_indices(
+                    [episode.episode_index for episode in episodes],
+                    task_name=source.task_name,
+                    val_set_proportion=self.val_set_proportion,
+                    is_training_set=self.is_training_set,
+                    seed=self.seed,
+                )
+            )
+            episodes = [
+                episode for episode in episodes if episode.episode_index in selected_indices
+            ]
             self.selected_episodes.extend((source, episode) for episode in episodes)
         if not self.selected_episodes:
             raise ValueError("DexJoCo dataset selection contains no episodes.")
@@ -399,4 +441,7 @@ class DexJoCoV3Dataset(torch.utils.data.Dataset):
             action_horizon=self.action_size,
             transform=preprocessor.action_state_transform,
             statistics_mode="production",
+            val_set_proportion=self.val_set_proportion,
+            split_seed=self.seed,
+            subset="train" if self.is_training_set else "validation",
         )

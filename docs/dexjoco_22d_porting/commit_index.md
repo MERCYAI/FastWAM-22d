@@ -12,7 +12,9 @@
 | Phase 5 | 2026-08-15 | 已提交 | `88c040066d6618dd24443ee0965673497df035c3` | `feat(train): close DexJoCo 22d training loop` | 六任务单步 joint training、梯度/更新审计、版本化 checkpoint artifacts、resume fail-fast 和 save/reload smoke |
 | Phase 6 DexJoCo | 2026-08-15 | 已提交 | `992abca3da2bb34475485658bf76b766c49b7efa` | `feat(eval): add FastWAM DexJoCo client` | 六任务 client config、22D websocket/action adapter、23D simulator command、chunk/replan 和短 simulator smoke |
 | Phase 6 DexJoCo import fix | 2026-08-15 | 已提交 | `3c85e48dc50c29e204259261eb97f3419e26e969` | `fix(eval): lazy-load DexJoCo simulator adapter` | protocol-only client 惰性加载 simulator 依赖，支持跨仓库 websocket smoke |
-| Phase 6 FastWAM | 2026-08-15 | 本文件所在提交 | self | `feat(inference): serve DexJoCo 22d actions` | 无 cache 双 Action Expert sampler、strict websocket server、stats/T5 cache/checkpoint policy 和 targeted smoke |
+| Phase 6 FastWAM | 2026-08-15 | 已提交 | `34e1dd30158b05924a59496872930cf0ff01bb2a` | `feat(inference): serve DexJoCo 22d actions` | 无 cache 双 Action Expert sampler、strict websocket server、stats/T5 cache/checkpoint policy 和 targeted smoke |
+| Phase 7 monitoring | 2026-08-15 | 本文件所在提交 | self | `feat(train): add DexJoCo TensorBoard monitoring` | rank-0 TensorBoard、loss-only validation、90/10 split、statistics parity、launcher/summary 和 4+1-step smoke |
+| Phase 7 experiment | 2026-08-15 | 待训练结束后提交 | pending | `docs: record DexJoCo joint post-training run` | production statistics/T5 cache/full-model run hashes、loss 收敛摘要和 checkpoint 选择依据 |
 
 ## Phase 0 提交边界
 
@@ -69,3 +71,11 @@
 - FastWAM 只 stage inference package、DexJoCo uncached sampler、server/precompute/smoke scripts、依赖声明和本目录 Phase 6 记录。
 - 不 stage checkpoint、statistics、T5 cache、simulator video、训练/评测输出或 DexJoCo 用户文件。
 - 提交前必须通过 `git diff --cached --check`，并人工复核 `git diff --cached --stat` 和 `git diff --cached`。
+
+## Phase 7 监控实现提交边界
+
+- FastWAM 起始 HEAD：`34e1dd30158b05924a59496872930cf0ff01bb2a`。
+- DexJoCo 参考 HEAD：`3c85e48dc50c29e204259261eb97f3419e26e969`；两个用户文件不修改、不 stage。
+- 只 stage TensorBoard/validation/statistics split 实现、三个 Phase 7 scripts、配置/依赖和 Phase 7 项目记录。
+- 不 stage event、checkpoint、statistics、T5 cache、数据、正式 run 日志或 `/tmp` smoke 产物。
+- 提交前必须通过 `git diff --cached --check`，并人工复核 `git diff --cached --stat` 和完整 `git diff --cached`。

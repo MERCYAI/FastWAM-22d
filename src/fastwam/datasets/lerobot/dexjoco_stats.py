@@ -19,7 +19,11 @@ from .dexjoco_contract import (
     DEXJOCO_TASKS,
     validate_dexjoco_statistics,
 )
-from .dexjoco_v3_dataset import DexJoCoV3TaskSource
+from .dexjoco_v3_dataset import (
+    DEXJOCO_EPISODE_SPLIT_POLICY,
+    DexJoCoV3TaskSource,
+    select_dexjoco_episode_indices,
+)
 
 
 TensorTransform = Callable[[Dict[str, Dict[str, torch.Tensor]]], Dict[str, Any]]
@@ -70,6 +74,9 @@ def compute_dexjoco_statistics(
     transform: Optional[TensorTransform] = None,
     max_episodes_per_task: Optional[int] = None,
     statistics_mode: Optional[str] = None,
+    val_set_proportion: float = 0.0,
+    split_seed: int = 42,
+    subset: str = "train",
 ) -> Dict[str, Any]:
     if action_horizon <= 0:
         raise ValueError("action_horizon must be positive.")
@@ -82,11 +89,14 @@ def compute_dexjoco_statistics(
         raise ValueError(f"Unsupported statistics_mode: {mode!r}")
     if max_episodes_per_task is not None and mode != "smoke":
         raise ValueError("Limited DexJoCo statistics must be marked as smoke.")
+    if subset != "train":
+        raise ValueError("DexJoCo normalization statistics may only use the train subset.")
 
     episode_actions: list[torch.Tensor] = []
     episode_states: list[torch.Tensor] = []
     episode_counts: Dict[str, int] = {}
     frame_counts: Dict[str, int] = {}
+    episode_indices: Dict[str, list[int]] = {}
     tasks = [source.task_name for source in task_sources]
 
     for source in task_sources:
@@ -123,6 +133,7 @@ def compute_dexjoco_statistics(
             task_frames += action.shape[0]
         episode_counts[source.task_name] = len(episodes)
         frame_counts[source.task_name] = task_frames
+        episode_indices[source.task_name] = [episode.episode_index for episode in episodes]
 
     global_action, action_near_zero = _summarize(torch.cat(episode_actions, dim=0))
     global_state, state_near_zero = _summarize(torch.cat(episode_states, dim=0))
@@ -143,6 +154,14 @@ def compute_dexjoco_statistics(
         "statistics_mode": mode,
         "production": production,
         "split": "train",
+        "data_distribution": "rand_obj",
+        "episode_split": {
+            "policy": DEXJOCO_EPISODE_SPLIT_POLICY,
+            "seed": int(split_seed),
+            "val_set_proportion": float(val_set_proportion),
+            "subset": subset,
+            "episode_indices": episode_indices,
+        },
         "tasks": tasks,
         "action_ordering": list(DEXJOCO_ACTION_ORDERING),
         "state_ordering": list(DEXJOCO_STATE_ORDERING),
@@ -180,6 +199,8 @@ def compute_dexjoco_statistics_from_root(
     split: str = "train",
     action_horizon: int = 32,
     max_episodes_per_task: Optional[int] = None,
+    val_set_proportion: float = 0.0,
+    split_seed: int = 42,
 ) -> Dict[str, Any]:
     if split != "train":
         raise ValueError("DexJoCo statistics may only be computed from the training split.")
@@ -187,8 +208,22 @@ def compute_dexjoco_statistics_from_root(
     sources = [
         DexJoCoV3TaskSource(root / task, task, split=split) for task in output_tasks
     ]
+    selected_episode_indices = {
+        source.task_name: select_dexjoco_episode_indices(
+            [episode.episode_index for episode in source.episodes],
+            task_name=source.task_name,
+            val_set_proportion=val_set_proportion,
+            is_training_set=True,
+            seed=split_seed,
+        )
+        for source in sources
+    }
     return compute_dexjoco_statistics(
         task_sources=sources,
         action_horizon=action_horizon,
+        selected_episode_indices=selected_episode_indices,
         max_episodes_per_task=max_episodes_per_task,
+        val_set_proportion=val_set_proportion,
+        split_seed=split_seed,
+        subset="train",
     )

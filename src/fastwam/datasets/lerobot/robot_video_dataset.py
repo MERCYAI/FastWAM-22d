@@ -1,5 +1,6 @@
 import hashlib
 import os
+from pathlib import Path
 from typing import Optional
 import time
 import numpy as np
@@ -36,6 +37,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         pretrained_norm_stats=None,
         val_set_proportion=0.05,
         is_training_set=False,
+        seed: int = 42,
         global_sample_stride=1,
         action_video_freq_ratio: int = 1,
         skip_padding_as_possible: bool = False,
@@ -56,6 +58,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             action_size=num_frames - 1,
             val_set_proportion=val_set_proportion,
             is_training_set=is_training_set,
+            seed=seed,
             global_sample_stride=global_sample_stride,
         )
     
@@ -111,7 +114,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 logger.info(f"Using dataset stats: {pretrained_norm_stats}")
                 if PartialState().is_main_process:
                     work_dir = misc.get_work_dir()
-                    save_dataset_stats_to_json(dataset_stats, os.path.join(work_dir, "dataset_stats.json"))
+                    output_stats_path = Path(work_dir) / "dataset_stats.json"
+                    input_stats_path = Path(pretrained_norm_stats).expanduser()
+                    if input_stats_path.resolve() != output_stats_path.resolve():
+                        save_dataset_stats_to_json(dataset_stats, output_stats_path)
 
             processor.set_normalizer_from_stats(dataset_stats)
             self.lerobot_dataset.set_processor(processor)

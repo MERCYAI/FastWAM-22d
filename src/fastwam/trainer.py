@@ -290,17 +290,34 @@ class Wan22Trainer:
                 "Expected one of: ['no', 'fp16', 'bf16']."
             )
         self.wandb_enabled = bool(cfg.wandb.enabled)
+        tensorboard_cfg = cfg.get("tensorboard") or {}
+        self.tensorboard_enabled = bool(tensorboard_cfg.get("enabled", False))
+        self.tensorboard_log_dir = str(
+            tensorboard_cfg.get("log_dir", os.path.join(self.output_dir, "tensorboard"))
+        )
+        self.tensorboard_flush_every = max(
+            int(tensorboard_cfg.get("flush_every", 10)), 1
+        )
 
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.gradient_accumulation_steps,
             mixed_precision=self.mixed_precision,
             step_scheduler_with_optimizer=False,
+            cpu=bool(cfg.get("accelerator_cpu", False)),
         )
         
+        deepspeed_plugin = self.accelerator.state.deepspeed_plugin
+        zero_stage = (
+            deepspeed_plugin.deepspeed_config.get("zero_optimization", {}).get(
+                "stage", "unknown"
+            )
+            if deepspeed_plugin is not None
+            else "disabled"
+        )
         logger.info(
             "Accelerate training: distributed_type=%s zero_stage=%s world_size=%d process_index=%d cfg_mixed_precision=%s accelerator_mixed_precision=%s grad_accum=%d grad_clip=%.4f",
             self.accelerator.distributed_type,
-            self.accelerator.state.deepspeed_plugin.deepspeed_config.get("zero_optimization", {}).get("stage", "unknown"),
+            zero_stage,
             self.accelerator.num_processes,
             self.accelerator.process_index,
             self.mixed_precision,
@@ -346,10 +363,13 @@ class Wan22Trainer:
         self.model, self.optimizer, self.train_loader, self.scheduler = self.accelerator.prepare(
             self.model, self.optimizer, self.train_loader, self.scheduler
         )
+        self._restore_optimizer_group_names()
         self.optimizer.zero_grad(set_to_none=True)
         self.wandb_run = None
+        self.tensorboard_writer = None
         self._init_wandb()
         self._resume_or_load_checkpoint()
+        self._init_tensorboard()
 
         val_size = len(self.val_dataset) if self.val_dataset is not None else len(self.train_dataset)
         logger.info("Train/val dataset size: %d/%d", len(self.train_dataset), val_size)
@@ -389,6 +409,184 @@ class Wan22Trainer:
             return
         self.wandb_run.finish()
         self.wandb_run = None
+
+    def _init_tensorboard(self):
+        if not self.tensorboard_enabled or not self.accelerator.is_main_process:
+            return
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ImportError as exc:
+            raise ImportError(
+                "TensorBoard logging is enabled but the declared `tensorboard` dependency "
+                "is unavailable. Install the project dependencies from pyproject.toml."
+            ) from exc
+
+        ensure_dir(self.tensorboard_log_dir)
+        purge_step = self.global_step if self.global_step > 0 else None
+        self.tensorboard_writer = SummaryWriter(
+            log_dir=self.tensorboard_log_dir,
+            purge_step=purge_step,
+        )
+        logger.info(
+            "Initialized TensorBoard writer: log_dir=%s global_step=%d purge_step=%s",
+            self.tensorboard_log_dir,
+            self.global_step,
+            purge_step,
+        )
+
+    def _tensorboard_log(self, payload: Mapping[str, float]) -> None:
+        if self.tensorboard_writer is None:
+            return
+        for tag, value in payload.items():
+            scalar = float(value)
+            if not np.isfinite(scalar):
+                raise FloatingPointError(
+                    f"Refusing to write non-finite TensorBoard scalar {tag}={scalar}."
+                )
+            self.tensorboard_writer.add_scalar(tag, scalar, self.global_step)
+        if self.global_step % self.tensorboard_flush_every == 0:
+            self.tensorboard_writer.flush()
+
+    def _finish_tensorboard(self) -> None:
+        if self.tensorboard_writer is None:
+            return
+        try:
+            self.tensorboard_writer.flush()
+        finally:
+            self.tensorboard_writer.close()
+            self.tensorboard_writer = None
+
+    def _finish_tracking(self) -> None:
+        self._finish_tensorboard()
+        self._finish_wandb()
+
+    def _is_dexjoco_model(self) -> bool:
+        return _dexjoco_dimensions(self.accelerator.unwrap_model(self.model)) is not None
+
+    @staticmethod
+    def _parameter_grad_squared_norm(
+        parameters, *, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        unique_parameters = {id(parameter): parameter for parameter in parameters}.values()
+        squared_norm = torch.zeros((), device=device, dtype=torch.float32)
+        gradient_count = torch.zeros((), device=device, dtype=torch.float32)
+        safe_get_local_grad = None
+        for parameter in unique_parameters:
+            gradient = parameter.grad
+            if gradient is None and hasattr(parameter, "ds_id"):
+                if safe_get_local_grad is None:
+                    from deepspeed.utils import safe_get_local_grad as zero3_local_grad
+
+                    safe_get_local_grad = zero3_local_grad
+                gradient = safe_get_local_grad(parameter)
+            if gradient is None:
+                continue
+            gradient_count += 1
+            squared_norm = squared_norm + gradient.detach().float().pow(2).sum()
+        return squared_norm, gradient_count
+
+    def _distributed_parameter_grad_norm(
+        self, parameters, *, device: torch.device
+    ) -> torch.Tensor:
+        squared_norm, gradient_count = self._parameter_grad_squared_norm(
+            parameters, device=device
+        )
+        squared_norm = self.accelerator.reduce(squared_norm, reduction="sum")
+        gradient_count = self.accelerator.reduce(gradient_count, reduction="sum")
+        if float(gradient_count.item()) <= 0:
+            return torch.full((), float("nan"), device=device, dtype=torch.float32)
+
+        deepspeed_plugin = self.accelerator.state.deepspeed_plugin
+        zero_stage = (
+            int(
+                deepspeed_plugin.deepspeed_config.get("zero_optimization", {}).get(
+                    "stage", 0
+                )
+            )
+            if deepspeed_plugin is not None
+            else 0
+        )
+        if zero_stage < 2:
+            squared_norm = squared_norm / max(self.accelerator.num_processes, 1)
+        return squared_norm.sqrt()
+
+    def _dexjoco_gradient_norms(self, *, device: torch.device) -> dict[str, torch.Tensor]:
+        model = self.accelerator.unwrap_model(self.model)
+        if _dexjoco_dimensions(model) is None:
+            return {}
+        action_new_parameters = self._optimizer_group_parameters.get("action_new", ())
+        if not action_new_parameters:
+            raise RuntimeError("DexJoCo optimizer is missing the `action_new` parameter group.")
+        return {
+            "video": self._distributed_parameter_grad_norm(
+                model.video_expert.parameters(), device=device
+            ),
+            "arm": self._distributed_parameter_grad_norm(
+                model.action_expert.parameters(), device=device
+            ),
+            "hand": self._distributed_parameter_grad_norm(
+                model.hand_expert.parameters(), device=device
+            ),
+            "action_new": self._distributed_parameter_grad_norm(
+                action_new_parameters, device=device
+            ),
+        }
+
+    @staticmethod
+    def _weighted_action_mse(
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        action_is_pad: torch.Tensor | None,
+        action_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        token_loss = torch.nn.functional.mse_loss(
+            prediction.float(), target.float(), reduction="none"
+        ).mean(dim=2)
+        if action_is_pad is None:
+            per_sample = token_loss.mean(dim=1)
+        else:
+            valid = (~action_is_pad).to(device=token_loss.device, dtype=token_loss.dtype)
+            per_sample = (token_loss * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)
+        return (per_sample * action_weight.to(per_sample)).mean()
+
+    def _dexjoco_action_diagnostics(
+        self,
+        sample: Mapping,
+        outputs: Mapping[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        model = self.accelerator.unwrap_model(self.model)
+        prediction = outputs["action"].detach()
+        target = outputs["target_action"].detach()
+        action_weight = model.train_action_scheduler.training_weight(
+            outputs["timestep_action"]
+        )
+        action_is_pad = sample.get("action_is_pad")
+        scale = float(model.loss_lambda_action)
+        return {
+            "loss_arm_6d": scale
+            * self._weighted_action_mse(
+                prediction[..., :DEXJOCO_ARM_ACTION_DIM],
+                target[..., :DEXJOCO_ARM_ACTION_DIM],
+                action_is_pad=action_is_pad,
+                action_weight=action_weight,
+            ),
+            "loss_hand_16d": scale
+            * self._weighted_action_mse(
+                prediction[..., DEXJOCO_ARM_ACTION_DIM:],
+                target[..., DEXJOCO_ARM_ACTION_DIM:],
+                action_is_pad=action_is_pad,
+                action_weight=action_weight,
+            ),
+            "action_pred_mean": prediction.detach().float().mean(),
+            "action_pred_std": prediction.detach().float().std(unbiased=False),
+            "action_target_mean": target.detach().float().mean(),
+            "action_target_std": target.detach().float().std(unbiased=False),
+        }
+
+    def _gather_scalar(self, value: torch.Tensor | float, *, device: torch.device) -> float:
+        tensor = torch.as_tensor(value, device=device, dtype=torch.float32).reshape(1)
+        return float(self.accelerator.gather(tensor).mean().item())
 
     def _build_loader(self, dataset, worker_init_fn=None):
         self.train_sampler = ResumableEpochSampler(
@@ -505,6 +703,18 @@ class Wan22Trainer:
             weight_decay=self.weight_decay,
             betas=(0.9, 0.95),
         )
+        self._optimizer_group_names = tuple(
+            str(group.get("name", f"group_{index}"))
+            for index, group in enumerate(optimizer.param_groups)
+        )
+        self._optimizer_group_parameters = {
+            name: tuple(group["params"])
+            for name, group in zip(
+                self._optimizer_group_names,
+                optimizer.param_groups,
+                strict=True,
+            )
+        }
         for index, group in enumerate(optimizer.param_groups):
             parameters = list(group["params"])
             logger.info(
@@ -516,6 +726,26 @@ class Wan22Trainer:
                 sum(parameter.numel() for parameter in parameters),
             )
         return optimizer
+
+    def _restore_optimizer_group_names(self) -> None:
+        prepared_groups = self.optimizer.param_groups
+        if len(prepared_groups) != len(self._optimizer_group_names):
+            raise RuntimeError(
+                "Accelerator changed the number of optimizer parameter groups: "
+                f"before={len(self._optimizer_group_names)}, after={len(prepared_groups)}."
+            )
+        for expected_name, group in zip(
+            self._optimizer_group_names,
+            prepared_groups,
+            strict=True,
+        ):
+            existing_name = group.get("name")
+            if existing_name is not None and str(existing_name) != expected_name:
+                raise RuntimeError(
+                    "Accelerator reordered optimizer parameter groups: "
+                    f"expected={expected_name!r}, got={existing_name!r}."
+                )
+            group["name"] = expected_name
 
     def _build_scheduler(self, scheduler_type, total_train_steps: int, warmup_steps: int = 0):
         return build_lr_scheduler(
@@ -583,6 +813,18 @@ class Wan22Trainer:
         proprio = sample.get("proprio", None)
         context = sample.get("context", None)
         context_mask = sample.get("context_mask", None)
+        padding_masks = {}
+        for key in ("action_is_pad", "image_is_pad", "proprio_is_pad"):
+            value = sample.get(key)
+            if value is not None:
+                if value.ndim == 1:
+                    value = value.unsqueeze(0)
+                if value.ndim != 2:
+                    raise ValueError(
+                        f"`sample[{key!r}]` must have shape [T] or [B,T], "
+                        f"got {tuple(value.shape)}."
+                    )
+            padding_masks[key] = value
 
         if not isinstance(video, torch.Tensor):
             raise TypeError(
@@ -644,7 +886,7 @@ class Wan22Trainer:
                     f"`context/context_mask` must be [B,L,D]/[B,L], got {tuple(context.shape)} and {tuple(context_mask.shape)}"
                 )
 
-        return {
+        result = {
             "video": video,
             "prompt": prompt,
             "action": action,
@@ -653,6 +895,47 @@ class Wan22Trainer:
             "context_mask": context_mask,
             "action_horizon": action_horizon,
         }
+        result.update(padding_masks)
+        return result
+
+    @torch.no_grad()
+    def evaluate_loss(self):
+        """Evaluate one deterministic per-rank sample without rollout or video decoding."""
+
+        if self.val_dataset is None:
+            return None
+        model = self.accelerator.unwrap_model(self.model)
+        if _dexjoco_dimensions(model) is None:
+            raise TypeError("`evaluate_loss` is reserved for the DexJoCo dual-action model.")
+
+        self.model.eval()
+        try:
+            rng = torch.Generator(device="cpu").manual_seed(
+                self.global_step + self.accelerator.process_index
+            )
+            eval_index = torch.randint(
+                0, len(self.val_dataset), (1,), generator=rng
+            ).item()
+            sample = self._to_batched_eval_sample(self.val_dataset[eval_index])
+            with self.accelerator.autocast():
+                loss, loss_dict, outputs = self.model(sample, return_outputs=True)
+            diagnostics = self._dexjoco_action_diagnostics(sample, outputs)
+            device = loss.device
+            return {
+                "loss_total": self._gather_scalar(loss.detach(), device=device),
+                "loss_video": self._gather_scalar(loss_dict["loss_video"], device=device),
+                "loss_action_22d": self._gather_scalar(
+                    loss_dict["loss_action"], device=device
+                ),
+                "loss_arm_6d": self._gather_scalar(
+                    diagnostics["loss_arm_6d"], device=device
+                ),
+                "loss_hand_16d": self._gather_scalar(
+                    diagnostics["loss_hand_16d"], device=device
+                ),
+            }
+        finally:
+            self._set_dit_only_train_mode()
 
     @torch.no_grad()
     def evaluate(self):
@@ -1004,8 +1287,24 @@ class Wan22Trainer:
 
         self.accelerator.wait_for_everyone()
         ckpt_path = None
-        if self.accelerator.is_main_process:
+        deepspeed_plugin = self.accelerator.state.deepspeed_plugin
+        zero_stage = (
+            int(
+                deepspeed_plugin.deepspeed_config.get("zero_optimization", {}).get(
+                    "stage", 0
+                )
+            )
+            if deepspeed_plugin is not None
+            else 0
+        )
+        if self.accelerator.is_main_process and zero_stage < 3:
             ckpt_path = self._save_weights_checkpoint(step_tag=step_tag)
+        elif self.accelerator.is_main_process:
+            logger.info(
+                "Skipping standalone weights checkpoint for ZeRO stage %d; "
+                "the sharded Accelerate/DeepSpeed state is the authoritative checkpoint.",
+                zero_stage,
+            )
         self.accelerator.wait_for_everyone()
 
         state_path = os.path.join(self.state_dir, step_tag)
@@ -1100,9 +1399,16 @@ class Wan22Trainer:
         )
 
     def train(self):
+        try:
+            return self._train_loop()
+        finally:
+            self._finish_tracking()
+
+    def _train_loop(self):
         self._set_dit_only_train_mode()
 
         unwrapped_model = self.accelerator.unwrap_model(self.model)
+        is_dexjoco = _dexjoco_dimensions(unwrapped_model) is not None
 
         if self.max_steps is None:
             raise ValueError("`max_steps` must be set before entering the while-step training loop.")
@@ -1111,51 +1417,91 @@ class Wan22Trainer:
         data_iter = iter(self.train_loader)
         self.run_start_step = self.global_step
         self.run_start_time = time.perf_counter()
+        data_wait_started = time.perf_counter()
+        optimizer_step_started = time.perf_counter()
 
         while self.global_step < self.max_steps:
             try:
                 sample = next(data_iter)
+                data_time = time.perf_counter() - data_wait_started
                 self.batch_in_epoch += 1
             except StopIteration:
                 self.epoch += 1
                 self.batch_in_epoch = 0
                 self.train_sampler.clear_resume_batch_offset()
                 data_iter = iter(self.train_loader)
+                data_wait_started = time.perf_counter()
                 continue
 
             with self.accelerator.accumulate(self.model):
-                train_model = self.model if hasattr(self.model, "training_loss") else self.accelerator.unwrap_model(self.model)
+                should_capture_diagnostics = (
+                    is_dexjoco
+                    and self.tensorboard_enabled
+                    and self.log_every > 0
+                    and (self.global_step + 1) % self.log_every == 0
+                )
 
                 with self.accelerator.autocast():
-                    loss, loss_dict = train_model.training_loss(sample)
+                    if should_capture_diagnostics:
+                        loss, loss_dict, outputs = self.model(
+                            sample, return_outputs=True
+                        )
+                    else:
+                        loss, loss_dict = self.model(sample)
+                        outputs = None
                 self.accelerator.backward(loss)
 
                 if self.accelerator.sync_gradients:
+                    should_log = self.log_every > 0 and (self.global_step + 1) % self.log_every == 0
+                    self.accelerator.unscale_gradients()
+                    group_grad_norms = (
+                        self._dexjoco_gradient_norms(device=loss.device)
+                        if should_log and is_dexjoco and self.tensorboard_enabled
+                        else {}
+                    )
                     grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     self.optimizer.step()
-                    if not self.accelerator.optimizer_step_was_skipped:
+                    optimizer_step_was_skipped = self.accelerator.optimizer_step_was_skipped
+                    if not optimizer_step_was_skipped:
                         self.scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
+                    if optimizer_step_was_skipped:
+                        logger.warning(
+                            "Optimizer step was skipped; global_step and TensorBoard step remain %d.",
+                            self.global_step,
+                        )
+                        data_wait_started = time.perf_counter()
+                        optimizer_step_started = data_wait_started
+                        continue
                     self.global_step += 1
-                    global_loss = float(
-                        self.accelerator.gather(loss.detach().float().reshape(1)).mean().item()
-                    )
+                    global_loss = self._gather_scalar(loss.detach(), device=loss.device)
                     global_loss_metrics = {}
                     for key, value in loss_dict.items():
-                        metric_tensor = torch.tensor(float(value), device=loss.device, dtype=torch.float32).reshape(1)
-                        global_loss_metrics[key] = float(
-                            self.accelerator.gather(metric_tensor).mean().item()
+                        global_loss_metrics[key] = self._gather_scalar(
+                            value, device=loss.device
                         )
-                    grad_norm_tensor = torch.tensor(grad_norm, device=loss.device, dtype=torch.float32)
-                    global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
+                    global_grad_norm = self._gather_scalar(grad_norm, device=loss.device)
+
+                    global_diagnostics = {}
+                    if should_log and outputs is not None:
+                        diagnostics = self._dexjoco_action_diagnostics(sample, outputs)
+                        global_diagnostics = {
+                            key: self._gather_scalar(value, device=loss.device)
+                            for key, value in diagnostics.items()
+                        }
+                    global_group_grad_norms = {
+                        key: self._gather_scalar(value, device=loss.device)
+                        for key, value in group_grad_norms.items()
+                    }
 
                     current_lrs = {
                         str(group.get("name", f"group_{index}")): float(group["lr"])
                         for index, group in enumerate(self.optimizer.param_groups)
                     }
                     current_lr = next(iter(current_lrs.values()))
+                    step_time = time.perf_counter() - optimizer_step_started
 
-                    if self.log_every > 0 and self.global_step % self.log_every == 0 and self.accelerator.is_main_process:
+                    if should_log and self.accelerator.is_main_process:
                         eta_str, steps_per_sec = self._estimate_eta()
                         description = "[train] epoch=%d step=%d/%d loss=%.4f " % (
                             self.epoch,
@@ -1190,39 +1536,95 @@ class Wan22Trainer:
                             wandb_payload[f"train/{key}"] = value
                         self._wandb_log(wandb_payload)
 
+                        if is_dexjoco and self.tensorboard_enabled:
+                            tensorboard_payload = {
+                                "train/loss_total": global_loss,
+                                "train/loss_video": global_loss_metrics["loss_video"],
+                                "train/loss_action_22d": global_loss_metrics["loss_action"],
+                                "train/loss_arm_6d": global_diagnostics["loss_arm_6d"],
+                                "train/loss_hand_16d": global_diagnostics["loss_hand_16d"],
+                                "train/step_time": step_time,
+                                "train/data_time": data_time,
+                                "train/epoch": float(self.epoch),
+                                "train/samples_seen": float(
+                                    self.global_step
+                                    * self.batch_size
+                                    * self.accelerator.num_processes
+                                    * self.gradient_accumulation_steps
+                                ),
+                                "action_pred/mean": global_diagnostics["action_pred_mean"],
+                                "action_pred/std": global_diagnostics["action_pred_std"],
+                                "action_target/mean": global_diagnostics["action_target_mean"],
+                                "action_target/std": global_diagnostics["action_target_std"],
+                            }
+                            tensorboard_payload.update(
+                                {
+                                    f"lr/{group_name}": group_lr
+                                    for group_name, group_lr in current_lrs.items()
+                                }
+                            )
+                            tensorboard_payload.update(
+                                {
+                                    f"grad_norm/{group_name}": norm
+                                    for group_name, norm in global_group_grad_norms.items()
+                                }
+                            )
+                            self._tensorboard_log(tensorboard_payload)
+
                     if (
                         self.eval_every > 0
                         and self.val_dataset is not None
                         and self.global_step % self.eval_every == 0
                     ):
-                        metrics = self.evaluate()
+                        metrics = self.evaluate_loss() if is_dexjoco else self.evaluate()
                         self.accelerator.wait_for_everyone()
                         if metrics is not None and self.accelerator.is_main_process:
-                            description = "[eval] step=%d val_loss=%.4f infer_psnr=%.4f infer_ssim=%.4f" % (
-                                self.global_step,
-                                metrics["val_loss"],
-                                metrics["psnr_rd"],
-                                metrics["ssim_rd"],
-                            )
-                            if "action_l2" in metrics:
-                                description += " action_l2=%.4f" % metrics["action_l2"]
-                            if "action_l1" in metrics:
-                                description += " action_l1=%.4f" % metrics["action_l1"]
-                            logger.info(description)
-                            eval_payload = {
-                                "eval/val_loss": float(metrics["val_loss"]),
-                                "eval/psnr_rg": float(metrics["psnr_rg"]),
-                                "eval/ssim_rg": float(metrics["ssim_rg"]),
-                                "eval/psnr_rd": float(metrics["psnr_rd"]),
-                                "eval/ssim_rd": float(metrics["ssim_rd"]),
-                                "eval/psnr_dg": float(metrics["psnr_dg"]),
-                                "eval/ssim_dg": float(metrics["ssim_dg"]),
-                            }
-                            if "action_l2" in metrics:
-                                eval_payload["eval/action_l2"] = float(metrics["action_l2"])
-                            if "action_l1" in metrics:
-                                eval_payload["eval/action_l1"] = float(metrics["action_l1"])
-                            self._wandb_log(eval_payload)
+                            if is_dexjoco:
+                                logger.info(
+                                    "[eval] step=%d loss=%.4f video=%.4f action=%.4f "
+                                    "arm_diag=%.4f hand_diag=%.4f",
+                                    self.global_step,
+                                    metrics["loss_total"],
+                                    metrics["loss_video"],
+                                    metrics["loss_action_22d"],
+                                    metrics["loss_arm_6d"],
+                                    metrics["loss_hand_16d"],
+                                )
+                                val_payload = {
+                                    "val/loss_total": metrics["loss_total"],
+                                    "val/loss_video": metrics["loss_video"],
+                                    "val/loss_action_22d": metrics["loss_action_22d"],
+                                    "val/loss_arm_6d": metrics["loss_arm_6d"],
+                                    "val/loss_hand_16d": metrics["loss_hand_16d"],
+                                }
+                                self._tensorboard_log(val_payload)
+                                self._wandb_log(val_payload)
+                            else:
+                                description = "[eval] step=%d val_loss=%.4f infer_psnr=%.4f infer_ssim=%.4f" % (
+                                    self.global_step,
+                                    metrics["val_loss"],
+                                    metrics["psnr_rd"],
+                                    metrics["ssim_rd"],
+                                )
+                                if "action_l2" in metrics:
+                                    description += " action_l2=%.4f" % metrics["action_l2"]
+                                if "action_l1" in metrics:
+                                    description += " action_l1=%.4f" % metrics["action_l1"]
+                                logger.info(description)
+                                eval_payload = {
+                                    "eval/val_loss": float(metrics["val_loss"]),
+                                    "eval/psnr_rg": float(metrics["psnr_rg"]),
+                                    "eval/ssim_rg": float(metrics["ssim_rg"]),
+                                    "eval/psnr_rd": float(metrics["psnr_rd"]),
+                                    "eval/ssim_rd": float(metrics["ssim_rd"]),
+                                    "eval/psnr_dg": float(metrics["psnr_dg"]),
+                                    "eval/ssim_dg": float(metrics["ssim_dg"]),
+                                }
+                                if "action_l2" in metrics:
+                                    eval_payload["eval/action_l2"] = float(metrics["action_l2"])
+                                if "action_l1" in metrics:
+                                    eval_payload["eval/action_l1"] = float(metrics["action_l1"])
+                                self._wandb_log(eval_payload)
 
                     if self.save_every > 0 and self.global_step % self.save_every == 0:
                         ckpt_info = self.save_checkpoint()
@@ -1244,6 +1646,10 @@ class Wan22Trainer:
                                 ckpt_info["state_path"],
                             )
                         return
+
+                    optimizer_step_started = time.perf_counter()
+
+            data_wait_started = time.perf_counter()
 
         ckpt_info = self.save_checkpoint()
         if self.accelerator.is_main_process:

@@ -33,3 +33,8 @@ eval_every: 200
 gradient_accumulation_steps: 1
 weight_decay: 1.0e-2
 resume: null
+
+tensorboard:
+  enabled: true
+  log_dir: ${output_dir}/tensorboard
+  flush_every: 10

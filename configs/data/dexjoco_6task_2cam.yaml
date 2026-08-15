@@ -46,8 +46,9 @@ train:
   action_video_freq_ratio: 4
   video_size: [224, 448]
   camera_key: null
-  val_set_proportion: 0.0
+  val_set_proportion: 0.1
   is_training_set: true
+  seed: 42
   skip_padding_as_possible: false
   concat_multi_camera: horizontal
   return_camera_videos: true
@@ -77,3 +78,8 @@ train:
         size: [224, 224]
   text_embedding_cache_dir: ./data/text_embeds_cache/dexjoco
   context_len: 128
+
+validation:
+  enabled: true
+  val_set_proportion: 0.1
+  split_seed: 42

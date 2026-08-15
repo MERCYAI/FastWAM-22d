@@ -225,3 +225,31 @@
 - 风险：只验证单连接 request/reply 和一个任务的两步模拟；认证、并发、长连接、完整 episode 与六任务成功率尚未覆盖。
 - 门槛：完整 training split production statistics、真实六任务 T5 cache 和 joint-trained Phase 5 state directory 就绪；先进行目标 GPU 的短 server/client smoke，再授权完整评测。
 - 计划 FastWAM commit message：`feat(inference): serve DexJoCo 22d actions`
+
+## Phase 7 monitoring - 2026-08-15
+
+阶段目标：增加 rank-0 TensorBoard、loss 收敛摘要和与 production statistics 一致的 90/10 train/validation episode split。边界是 4+1 个 tiny CPU optimizer steps，不运行完整 pytest、正式 full-model train 或 simulator 评测。
+
+| ID | 检查 | 范围/方法 | 结果 | 证据或限制 |
+| --- | --- | --- | --- | --- |
+| P7-01 | 阶段 Git 基线 | 两仓库 status/branch/HEAD；读取全部项目记录；补 Phase 6 hashes | PASS | FastWAM `fastwam22d-train@34e1dd3...` 干净；DexJoCo `main@3c85e48...` 两个用户修改保持原样。 |
+| P7-02 | 数据完整性 | `/home/shared/ai/datasets/dexlewm/dexjoco` 六任务 v3 metadata | PASS | 每任务 100 episodes；总 218,993 frames；双相机；识别为 `rand_obj`，未发现独立 `rand_full` LeRobot root。 |
+| P7-03 | 90/10 split | shared `select_dexjoco_episode_indices()` + runtime train/val instantiate | PASS | 每任务 train=90、val=10；交集为空、并集覆盖 100；seed=42、task-local deterministic。 |
+| P7-04 | Statistics parity | `compute_dexjoco_stats.py --max-episodes-per-task 1 --val-set-proportion 0.1` | PASS/SMOKE ONLY | schema v1、22D/23D、`rand_obj`、split policy/IDs 已记录；六任务共 6 episodes/2,518 frames；`production=false`。 |
+| P7-05 | TensorBoard rank/step | actual `Wan22Trainer` 4 steps + save/resume to step 5 | PASS | rank 0 两个 event files；聚合 train steps `[1,2,3,5]`，resume purge step 4 后从 5 继续；无 step 0。 |
+| P7-06 | 必需 scalars | EventAccumulator 审计 25 tags | PASS | train/val total/video/action/arm/hand、3 LR、4 grad norms、timing/progress、prediction/target mean/std 均存在且 finite。 |
+| P7-07 | LR 和 gradient | 每个 event step 数值检查 | PASS | LR 比例始终 `10:5:1`；Video/Arm/Hand/action_new grad norm 均 finite/nonzero，且在 unscale 后、clip 前计算。 |
+| P7-08 | Frozen modules | tiny T5/VAE 全参数 | PASS | 5 steps 后 grad 始终 `None`；第一段训练前后参数逐 tensor 不变。 |
+| P7-09 | Writer cleanup | normal completion、resume completion | PASS | 两次 `train()` 返回后 writer 均为 `None`；flush/close 在 `finally`。 |
+| P7-10 | Summary CLI | smoke event，window=3、min_points=10 | PASS | total/video/action/arm/hand 均 `insufficient_data`；没有把 4 个点伪称收敛。 |
+| P7-11 | Launcher | 本地空 logdir、host 127.0.0.1、port 16006、timeout cleanup | PASS | 输出 `http://127.0.0.1:16006/`；默认不监听 0.0.0.0。 |
+| P7-12 | Dependency | TensorBoard 2.19 vs 2.21 import probe | PASS | 2.19 与 setuptools 83 不兼容；声明并实装 `tensorboard==2.21.0` 后 launcher/EventAccumulator 正常。 |
+| P7-13 | 语法/whitespace | `compileall`、`git diff --check` | PASS | Phase 7 Python 文件编译通过，无 whitespace error。 |
+| P7-14 | Phase 2/4/5 targeted regression | dual-action、optimizer、training-loop scripts | PASS | legacy instantiate、22D mask/forward、三组 LR/覆盖和 Phase 5 loss `4.11274576`、save/reload 均保持通过。 |
+| P7-15 | 完整 pytest/正式训练 | 未运行 | NOT RUN | 符合第一笔提交边界；正式 statistics/T5/full-model run 在监控实现 commit 后执行。 |
+
+### Phase 7 monitoring 风险和正式 run 门槛
+
+- 风险：tiny CPU 模型不覆盖 bf16/ZeRO2/4 GPU 或完整 7B trainable graph；validation diffusion loss 仍有 timestep/noise 随机波动。
+- 门槛：从干净监控实现 commit 生成 90 episodes/task production statistics、六 prompt T5 cache；先实测一个 full-model step 的显存/吞吐，再启动唯一一次有限预算正式 run。
+- 计划 commit message：`feat(train): add DexJoCo TensorBoard monitoring`

@@ -187,3 +187,35 @@
 - 决策：rotvec 用 SciPy 转为 `quaternion_wxyz`；Hand 16D 从 `_allegro_ctrl_ids` 对应的 MuJoCo `actuator_ctrlrange` clipping；未声明通用 Cartesian workspace 时 xyz 不做虚构范围 clipping。
 - 证据：现有 DexJoCo wrapper 使用 `as_quat(scalar_first=True)`，raw environment 按 `w,qx,qy,qz` 解包。
 - 影响：可在六任务 YAML 中显式设置 `xyz_min/xyz_max`，但默认均为 null。
+
+## D-0025：Rand_obj 按任务固定 90/10 episode 划分
+
+- 日期：2026-08-15
+- 状态：Accepted
+- 决策：用 `per_task_seeded_shuffle_v1` 和 seed 42 为每任务固定选择 90 training episodes 与 10 validation episodes；production statistics 只读取同一组 90 episodes。
+- 理由：原 DexJoCo config 未定义独立 val，runtime 会把 train dataset 当 val；若 statistics 扫描全部 100 episodes，又会把 validation 数据泄漏到 normalizer。
+- 影响：statistics JSON 记录 policy/seed/proportion/episode IDs；`rand_full` 不混入训练，保留为独立泛化评测。
+
+## D-0026：TensorBoard 绑定真实 optimizer step 且只由 rank 0 写入
+
+- 日期：2026-08-15
+- 状态：Accepted
+- 决策：writer 在 resume 之后创建，event step 使用恢复后的 `Wan22Trainer.global_step`；skipped optimizer step 不递增；rank 0 独占 writer，定期 flush 并在 `finally` close。
+- 理由：按 micro-batch、rank-local counter 或 resume 后从零写会破坏 loss/LR/checkpoint 的时间对应关系，并生成互相冲突的 event。
+- 影响：默认 legacy FastWAM 不启用；DexJoCo 写入 `${output_dir}/tensorboard`，不记录默认高开销 histogram。
+
+## D-0027：Arm/Hand loss 只作为诊断，不改变 22D objective
+
+- 日期：2026-08-15
+- 状态：Accepted
+- 决策：从同一次 `training_loss(..., return_outputs=True)` 的 prediction/target 计算 scheduler/padding-weighted 6D/16D MSE；反向传播仍只使用原 video/world objective 加完整 22D action objective。
+- 理由：分别 mean 后相加会把 Arm 和 Hand 各赋相同总权重，改变原 22D 每维等权数学定义。
+- 影响：TensorBoard arm/hand 曲线用于定位子空间问题，不能据此替代 joint action loss 或 simulator 指标。
+
+## D-0028：Loss 收敛摘要是多窗口工程诊断
+
+- 日期：2026-08-15
+- 状态：Accepted
+- 决策：状态同时考虑首尾窗口 mean/median、relative reduction、末窗口 slope/CV、NaN/Inf 和最小点数；点数不足一律 `insufficient_data`。
+- 理由：单个最终 loss 无法区分随机 diffusion 波动、短暂下降、平台或发散。
+- 影响：`plateau/converged` 仅表示配置阈值下的 loss 工程诊断，不替代六任务 success rate 或 `rand_full` 泛化评测。
