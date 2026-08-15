@@ -110,3 +110,31 @@
 - 风险：Hand backbone 尚未 remap；新 projection 初始化和迁移报告尚未落地；DexJoCo cache/joint inference 显式禁用；tiny CPU 模型不覆盖完整 5B 显存和分布式行为。
 - 门槛：实现并审计正式 checkpoint key remap/shape 报告，保持 Arm/Hand/proprio 新 projection 规则；另行设计能表达 Arm/Hand 交互的 cache/sampler；本阶段提交后需获得下一阶段明确授权。
 - 计划 commit message：`feat(model): add dual action experts for DexJoCo`
+
+## Phase 3 - 2026-08-15
+
+阶段目标：实现可审计、可保存 JSON 报告的 selective pretrained checkpoint loading。阶段边界是不处理 optimizer、resume state、正式训练、完整 pytest 或 simulator。
+
+| ID | 检查 | 范围/方法 | 结果 | 证据或限制 |
+| --- | --- | --- | --- | --- |
+| P3-01 | 阶段 Git 基线 | 两仓库 status/branch/HEAD；读取全部记录 | PASS | FastWAM `main@03caff2a...` 干净；DexJoCo `main@8d23b0fa...` 两个用户修改保持原样。 |
+| P3-02 | Phase 2 hash 回填 | `commit_index.md` | PASS | `03caff2af53632914ec7418716480b7a5ae6dbdc`。 |
+| P3-03 | 七类 synthetic 分类 | tiny 旧 `video+7D action` FastWAM `mot` payload，经 `module.model.mot.*` 前缀从临时 `.pt` 加载 | PASS | 成功报告：loaded=79、copied_to_hand=37、skipped_shape=0、skipped_policy=10、missing=0、unexpected=1、newly_initialized=10。 |
+| P3-04 | Tensor 相等抽查 | Video self-attn、Arm FFN、Hand cross-attn | PASS | Video/Arm 等于各自源 tensor；Hand 等于同一个旧 Action Expert local key。 |
+| P3-05 | Projection policy | 检查报告 target 集合和实际 shape | PASS | 10 个 Arm/Hand/proprio 参数都在 `skipped_policy`/`newly_initialized`，都不在 loaded/copied；Arm 6D、Hand 16D、proprio 23D。 |
+| P3-06 | 显式初始化 | 先把新 projection 全填 99，再 selective load | PASS | `Linear.reset_parameters` 已执行，报告 `initialization_applied=true`，结果不再为 sentinel。 |
+| P3-07 | fail-fast 与无部分写入 | 删除 1 个 Video key，并让 1 个旧 Action backbone tensor shape 错误 | EXPECTED FAIL | missing=1、skipped_shape=2（Arm/Hand）；抛 `SelectiveCheckpointError`，backbone/projection 均保持调用前值。 |
+| P3-08 | JSON schema | 读取临时 report JSON | PASS | `schema=fastwam.dexjoco_selective_checkpoint`、`version=1`，汇总与内存报告一致。 |
+| P3-09 | 完整配置 meta target | 构造正式 Video/Arm/Hand 模块 shape 图 | PASS | Video=825 keys、Arm=824、Hand=824、proprio=2；维度 6/16/23，不分配 5B 参数存储。 |
+| P3-10 | 新旧 Hydra compose | DexJoCo selective path/report override；原 FastWAM+LIBERO | PASS | 新 runtime 签名解析；原配置仍为 7D 且没有 selective 字段。 |
+| P3-11 | Phase 2 forward 回归 | 原 tiny dual-action smoke | PASS | Arm `[1,4,6]`、Hand `[1,4,16]`、action `[1,4,22]`、mask `[16,16]`。 |
+| P3-12 | 真实 checkpoint CPU dry-run | 搜索仓库、`outputs`、用户/root HF cache 和 `/home/shared/ai` | NOT RUN | 未找到 FastWAM weight checkpoint 或配置中的 ActionDiT 文件；不下载或伪造真实权重。 |
+| P3-13 | 聚焦语法/whitespace | `compileall`、`git diff --check` | PASS | 新 loader、模型/runtime 接线和两个 scripts 编译通过。 |
+| P3-14 | `ruff` | `conda run -n fastwam ruff check ...` | NOT RUN | `fastwam` 环境未安装 `ruff`，命令返回 127。 |
+| P3-15 | 完整 pytest/训练/optimizer | 未运行 | NOT RUN | 超出 Phase 3 边界。 |
+
+### Phase 3 风险和下一阶段门槛
+
+- 风险：没有真实旧 FastWAM checkpoint，因此本阶段只确认 synthetic tensor 内容和正式 5B config 的 meta key/shape 图；真实权重的 key/count 仍需在获得 checkpoint 后用审计 CLI 验证。
+- 门槛：真实报告必须满足 `missing_in_checkpoint=0`、`skipped_shape=0`，并人工复核 `unexpected_in_checkpoint`；之后才能设计 optimizer 分组或启动训练。
+- 计划 commit message：`feat(checkpoint): add selective DexJoCo weight loading`

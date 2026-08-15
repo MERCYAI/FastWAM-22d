@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from fastwam.utils.logging_config import get_logger
 
 from .action_dit import ActionDiT
+from .dexjoco_checkpoint import load_dexjoco_selective_checkpoint
 from .fastwam import FastWAM
 from .helpers.loader import load_wan22_ti2v_5b_components
 from .mot import MoT
@@ -130,6 +131,8 @@ class DexJoCoDualActionFastWAM(FastWAM):
         action_dit_config: dict[str, Any] | None = None,
         hand_dit_config: dict[str, Any] | None = None,
         action_dit_pretrained_path: str | None = None,
+        selective_checkpoint_path: str | None = None,
+        selective_checkpoint_report_path: str | None = None,
         skip_dit_load_from_pretrain: bool = False,
         mot_checkpoint_mixed_attn: bool = True,
         video_train_shift: float = 5.0,
@@ -152,6 +155,15 @@ class DexJoCoDualActionFastWAM(FastWAM):
         if int(hand_dit_config.get("action_dim", -1)) != cls.HAND_ACTION_DIM:
             raise ValueError("DexJoCo `hand_dit_config.action_dim` must be 16.")
 
+        use_selective_checkpoint = selective_checkpoint_path is not None
+        skip_base_dit_load = bool(skip_dit_load_from_pretrain or use_selective_checkpoint)
+        if use_selective_checkpoint:
+            logger.info(
+                "DexJoCo selective checkpoint requested; initializing Video/Arm/Hand DiTs "
+                "before audited loading from %s.",
+                selective_checkpoint_path,
+            )
+
         components = load_wan22_ti2v_5b_components(
             device=device,
             torch_dtype=torch_dtype,
@@ -160,14 +172,14 @@ class DexJoCoDualActionFastWAM(FastWAM):
             tokenizer_max_len=tokenizer_max_len,
             redirect_common_files=redirect_common_files,
             dit_config=video_dit_config,
-            skip_dit_load_from_pretrain=skip_dit_load_from_pretrain,
+            skip_dit_load_from_pretrain=skip_base_dit_load,
             load_text_encoder=load_text_encoder,
         )
         video_expert = components.dit
         action_expert = ActionDiT.from_pretrained(
             action_dit_config=action_dit_config,
             action_dit_pretrained_path=action_dit_pretrained_path,
-            skip_dit_load_from_pretrain=skip_dit_load_from_pretrain,
+            skip_dit_load_from_pretrain=skip_base_dit_load,
             device=device,
             torch_dtype=torch_dtype,
         )
@@ -211,16 +223,51 @@ class DexJoCoDualActionFastWAM(FastWAM):
             loss_lambda_action=loss_lambda_action,
         )
         model.model_paths = {
-            "video_dit": components.dit_path,
+            "video_dit": (
+                f"SELECTIVE_CHECKPOINT:{selective_checkpoint_path}"
+                if use_selective_checkpoint
+                else components.dit_path
+            ),
             "vae": components.vae_path,
             "text_encoder": components.text_encoder_path,
             "tokenizer": components.tokenizer_path,
             "action_dit_backbone": (
-                "SKIPPED_PRETRAIN" if skip_dit_load_from_pretrain else action_dit_pretrained_path
+                f"SELECTIVE_CHECKPOINT:{selective_checkpoint_path}"
+                if use_selective_checkpoint
+                else (
+                    "SKIPPED_PRETRAIN"
+                    if skip_dit_load_from_pretrain
+                    else action_dit_pretrained_path
+                )
             ),
-            "hand_dit_backbone": "RANDOM_INIT_PHASE2_PENDING_CHECKPOINT_REMAP",
+            "hand_dit_backbone": (
+                f"SELECTIVE_CHECKPOINT_REMAP:{selective_checkpoint_path}"
+                if use_selective_checkpoint
+                else "RANDOM_INIT_PHASE2_PENDING_CHECKPOINT_REMAP"
+            ),
         }
+        if use_selective_checkpoint:
+            model.selective_checkpoint_report = model.load_selective_pretrained_checkpoint(
+                selective_checkpoint_path,
+                report_path=selective_checkpoint_report_path,
+            ).to_dict()
         return model
+
+    def load_selective_pretrained_checkpoint(
+        self,
+        checkpoint,
+        *,
+        report_path: str | None = None,
+        apply: bool = True,
+        source_name: str | None = None,
+    ):
+        return load_dexjoco_selective_checkpoint(
+            self,
+            checkpoint,
+            report_path=report_path,
+            apply=apply,
+            source_name=source_name,
+        )
 
     def split_action(self, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if action.ndim != 3:

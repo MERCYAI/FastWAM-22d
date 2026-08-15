@@ -6,7 +6,8 @@
 | --- | --- | --- | --- | --- | --- |
 | Phase 0 | 2026-08-15 | 已提交 | `835c98b8c42471a5addf5666967706957844d7f4` | `docs: record DexJoCo 22d adaptation contract` | 仅新增 `docs/dexjoco_22d_porting/` 五份审计/记录文档 |
 | Phase 1 | 2026-08-15 | 已提交 | `8409c0fef83da8e88e185e8d5beb1f57b3d78131` | `feat(data): add DexJoCo 22d action pipeline` | DexJoCo v3 六任务 loader、22D/23D processor、statistics schema/CLI、smoke test 和阶段记录 |
-| Phase 2 | 2026-08-15 | 本文件所在提交 | self | `feat(model): add dual action experts for DexJoCo` | DexJoCo Video/Arm/Hand 三 expert MoT、22D action loss、23D proprio、专用 mask/cache fail-fast 和 tiny smoke |
+| Phase 2 | 2026-08-15 | 已提交 | `03caff2af53632914ec7418716480b7a5ae6dbdc` | `feat(model): add dual action experts for DexJoCo` | DexJoCo Video/Arm/Hand 三 expert MoT、22D action loss、23D proprio、专用 mask/cache fail-fast 和 tiny smoke |
+| Phase 3 | 2026-08-15 | 本文件所在提交 | self | `feat(checkpoint): add selective DexJoCo weight loading` | 精确 checkpoint key 分类、Video/Arm 加载、Action-to-Hand remap、新 projection 初始化、JSON 报告和 targeted smoke |
 
 ## Phase 0 提交边界
 
@@ -30,4 +31,12 @@
 - DexJoCo 参考 HEAD：`8d23b0fab23b17a58c4b55f3942e17013aaf8267`，不在该提交中修改。
 - 只 stage DexJoCo 专用模型/配置/smoke、`runtime.py` 新工厂和本目录 Phase 2 记录。
 - 不 stage checkpoint、完整权重、训练输出、optimizer 状态或 DexJoCo 用户文件。
+- 提交前必须通过 `git diff --cached --check`，并人工复核 `git diff --cached --stat` 和 `git diff --cached`。
+
+## Phase 3 提交边界
+
+- FastWAM 起始 HEAD：`03caff2af53632914ec7418716480b7a5ae6dbdc`。
+- DexJoCo 参考 HEAD：`8d23b0fab23b17a58c4b55f3942e17013aaf8267`，不在该提交中修改。
+- 只 stage DexJoCo selective checkpoint loader/config/runtime 接线、两个 targeted scripts 和本目录 Phase 3 记录。
+- 不 stage checkpoint、JSON smoke 临时文件、optimizer、训练输出或 DexJoCo 用户文件。
 - 提交前必须通过 `git diff --cached --check`，并人工复核 `git diff --cached --stat` 和 `git diff --cached`。

@@ -123,3 +123,35 @@
 - 决策：设置 `supports_video_kv_cache=False`，并让 DexJoCo cache/inference 入口输出 warning 后抛出 `NotImplementedError`。
 - 证据：现有 `MoT.forward_action_with_video_cache()` 只构造 `cached video + action` K/V 和 action queries，没有 Hand K/V/query，无法保持 Arm/Hand 双向交互。
 - 后续条件：只有在 cache 同时更新 Arm/Hand 且 sampler 分配完整 22D latent 后才能启用。
+
+## D-0017：Selective loading 只使用精确 root 和精确 local key
+
+- 日期：2026-08-15
+- 状态：Accepted
+- 决策：仅规范化声明的容器前缀，并只接受 `mot/dit.mixtures.video`、`mot/dit.mixtures.action`、`video_expert`、`action_expert`、`video`、`action`、`dit` 和 `proprio_encoder` 等精确 root；root 之后必须与目标模块 local state key 完全相等。
+- 理由：用模糊 suffix 匹配 30 层 DiT 的重复 `blocks.N.*` 名称可能把 Video/Arm/Hand tensor 错装到另一个 expert。
+- 影响：无支持 root 的 tensor 进入 `unexpected_in_checkpoint`；关键目标 key 不会由相似后缀补齐。
+
+## D-0018：Projection 的 policy skip 和新初始化分别记账
+
+- 日期：2026-08-15
+- 状态：Accepted
+- 决策：Arm/Hand 的 `action_encoder`、`head` 以及 23D `proprio_encoder` 同时出现在 `skipped_policy` 和 `newly_initialized`：前者记录不加载旧 tensor 的决定，后者记录实际调用 `torch.nn.Linear.reset_parameters`。
+- 理由：旧 7D Action Expert 的 bias 可能与新 encoder bias 偶然同 shape，但 shape 一致不代表语义可迁移；同时只记录 skip 不能证明目标参数经过显式初始化。
+- 影响：不执行 slice、插值或部分复制；机器报告明确记录 `initialization_applied`。
+
+## D-0019：关键 backbone 分类完成后再原子式应用
+
+- 日期：2026-08-15
+- 状态：Accepted
+- 决策：先分类 Video、Arm 和 Hand 的全部关键 backbone key，存在 `missing_in_checkpoint` 或 `skipped_shape` 时先写报告并抛 `SelectiveCheckpointError`，不执行 reset 或 tensor copy。
+- 理由：逐 key 边检查边写入会在后段发现错误时留下无法安全训练的部分加载模型。
+- 影响：`unexpected_in_checkpoint` 保留为可审计非致命项；关键缺失和 shape 冲突始终 fail-fast。
+
+## D-0020：单一旧 checkpoint 是三个 backbone 的来源
+
+- 日期：2026-08-15
+- 状态：Accepted
+- 决策：配置 `selective_checkpoint_path` 后跳过单独的 Wan Video DiT 和预处理 ActionDiT backbone 加载；同一 checkpoint 的 Video key 加载到 Video、Action key 加载到 Arm 并显式 remap 到 Hand。
+- 理由：这保证审计报告能完整说明三个目标 backbone 的来源，也避免在 selective load 前依赖仓库中当前不存在的 `ActionDiT_linear_interp_*.pt`。
+- 边界：VAE 和可选 text encoder 仍由现有 Wan 组件 loader 管理，不属于 Phase 3 selective policy。

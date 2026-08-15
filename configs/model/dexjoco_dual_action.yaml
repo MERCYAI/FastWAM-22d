@@ -7,6 +7,8 @@ proprio_dim: 23
 redirect_common_files: true
 mot_checkpoint_mixed_attn: true
 action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
+selective_checkpoint_path: null
+selective_checkpoint_report_path: null
 skip_dit_load_from_pretrain: false
 
 video_dit_config:
