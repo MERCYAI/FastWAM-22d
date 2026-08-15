@@ -167,3 +167,32 @@
 - 风险：当前 DexJoCo cached inference 仍按 Phase 2 fail-fast 禁用；六任务 production `dataset_stats.json` 仍未生成，不能启动正式训练。
 - 门槛：完整 training split statistics 就绪并通过 schema 校验；在目标分布式配置上做单步 forward/backward、optimizer/scheduler 和 save/resume smoke；确认双 Action Expert inference/cache 路径后再进入正式训练或仿真。
 - 计划 commit message：`feat(train): add DexJoCo parameter groups`
+
+## Phase 5 - 2026-08-15
+
+阶段目标：用真实六任务最小数据闭合 normalization -> joint diffusion/forward/loss -> backward/step -> checkpoint save/reload。边界是一个 tiny CPU optimizer step，不执行正式训练、完整 pytest、5B backward、DeepSpeed/多卡、推理或 simulator。
+
+| ID | 检查 | 范围/方法 | 结果 | 证据或限制 |
+| --- | --- | --- | --- | --- |
+| P5-01 | 阶段 Git 基线 | 两仓库 status/branch/HEAD；读取全部项目记录 | PASS | FastWAM `main@43f45064...` 干净；DexJoCo `main@8d23b0fa...` 两个用户修改保持原样；Phase 4 hash 已回填。 |
+| P5-02 | 六任务 dataloader | 每任务 episode 0 首 clip，真实 image/action/state + smoke normalizer | PASS | action `[6,4,22]`、state `[6,4,23]`、cameras `[6,2,3,5,16,16]`、video `[6,3,5,16,32]`；任务顺序匹配正式列表。 |
+| P5-03 | Statistics policy | Phase 1 六任务各 1 episode stats | PASS/SMOKE ONLY | `fastwam.dexjoco.dataset_stats@1`、`production=false`；仅显式 `allow_non_production_stats=true`，没有冒充正式统计。 |
+| P5-04 | 一次完整 22D diffusion | counting wrapper + `return_outputs` | PASS | action timestep 只采样 1 次、noise 只加 1 次且 shape `[6,4,22]`；Arm/Hand 共用 timestep。 |
+| P5-05 | Joint forward shapes | 1 层真实 Video/Arm/Hand + MoT | PASS | Arm `[6,4,6]`、Hand `[6,4,16]`、拼接 prediction/target `[6,4,22]`，全 finite。 |
+| P5-06 | Loss 数学 | 独立复算 padding/scheduler-weighted action objective | PASS | total=`4.11274576`、video=`2.52383971`、action=`1.58890617`；完整 22D MSE 与 `loss_action` 一致；video/world objective 未改。 |
+| P5-07 | Backward gradients | step 前逐模块审计所有 grad | PASS | Video 42/42、Arm backbone 37/37、Arm new 4/4、Hand backbone 37/37、Hand new 4/4、proprio 2/2 tensor 均 finite/nonzero。 |
+| P5-08 | Trainable 更新 | step 前后逐 tensor 比较 | PASS | 上述六类分别变化 42、37、4、37、4、2 个 tensor；optimizer steps=1。 |
+| P5-09 | Frozen 检查 | T5/VAE probe parameters | PASS | 所有 grad 为 `None`；step 前后逐 tensor 完全相等。 |
+| P5-10 | Checkpoint 内容 | `Wan22Trainer.save_checkpoint()` 临时目录 | PASS | model、optimizer、scheduler、resolved config、22/6/16/23D manifest、stats、selective report、trainer progress 均存在。 |
+| P5-11 | Save/reload | 新 tiny model/optimizer/scheduler 调用真实 `load_training_state()` | PASS | 全 model tensor 精确相等；optimizer group/state/LR、scheduler state、stats 内容和 step/batch offset 恢复一致。 |
+| P5-12 | Resume fail-fast | 分别损坏 action dim、proprio dim、statistics schema | EXPECTED FAIL | 三者均在 `accelerator.load_state()` 前抛错；没有加载任何 tensor state。 |
+| P5-13 | Phase 2–4 回归 | dual-action、selective checkpoint、optimizer scripts | PASS | forward/mask/cache fail-fast、七类 checkpoint 分类和三组 optimizer/scheduler 均保持通过。 |
+| P5-14 | 语法/whitespace | `compileall`、`git diff --check` | PASS | Phase 5 Python 文件编译和 whitespace 检查通过。 |
+| P5-15 | 完整 pytest/正式训练 | 未运行 | NOT RUN | 符合阶段边界；临时 checkpoint 自动删除，没有提交训练产物。 |
+
+### Phase 5 风险和正式训练门槛
+
+- 风险：tiny 单进程 CPU 结果不覆盖正式约 7B trainable parameters、bf16、ZeRO2/multi-rank shard、显存、通信或吞吐。
+- 风险：T5 context 为合成零 cache；persistent 数据根仍缺 `click_mouse`/`pinch_tongs`；production statistics 未生成；双 expert inference/cache 仍禁用。
+- 门槛：补齐六任务数据；不带 episode limit 计算 production training-split stats；生成真实 T5 cache；在目标 DeepSpeed 配置上先做 1-step 5B save/resume；之后才能授权正式训练。
+- 计划 commit message：`feat(train): close DexJoCo 22d training loop`

@@ -3,6 +3,7 @@ import json
 import inspect
 import os
 import re
+import shutil
 from collections.abc import Mapping
 from math import ceil, cos, pi
 from pathlib import Path
@@ -22,6 +23,14 @@ from torch.optim.lr_scheduler import (
 )
 from torch.utils.data import DataLoader
 
+from .datasets.lerobot.dexjoco_contract import (
+    DEXJOCO_ACTION_DIM,
+    DEXJOCO_ARM_ACTION_DIM,
+    DEXJOCO_HAND_ACTION_DIM,
+    DEXJOCO_PROPRIO_DIM,
+    validate_dexjoco_statistics,
+)
+from .models.wan22.dexjoco_checkpoint import REPORT_SCHEMA, REPORT_VERSION
 from .utils.fs import ensure_dir
 from .utils.logging_config import get_logger, setup_logging
 from .utils.pytorch_utils import set_global_seed
@@ -30,6 +39,166 @@ from .utils.video_io import save_mp4
 from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
 
 logger = get_logger(__name__)
+
+
+DEXJOCO_TRAINING_CHECKPOINT_SCHEMA = "fastwam.dexjoco.training_checkpoint"
+DEXJOCO_TRAINING_CHECKPOINT_VERSION = 1
+DEXJOCO_TRAINING_MANIFEST = "dexjoco_training_manifest.json"
+DEXJOCO_TRAINING_CONFIG = "training_config.yaml"
+DEXJOCO_DATASET_STATS = "dataset_stats.json"
+DEXJOCO_SELECTIVE_REPORT = "selective_loading_report.json"
+
+
+def _read_json_mapping(path: Path, description: str) -> dict:
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing {description}: {path}")
+    with path.open("r", encoding="utf-8") as file:
+        payload = json.load(file)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{description} must contain a JSON object: {path}")
+    return payload
+
+
+def _write_json(path: Path, payload: Mapping) -> None:
+    with path.open("w", encoding="utf-8") as file:
+        json.dump(dict(payload), file, ensure_ascii=True, indent=2)
+        file.write("\n")
+
+
+def _dexjoco_dimensions(model) -> dict[str, int] | None:
+    if not hasattr(model, "hand_expert"):
+        return None
+    dimensions = {
+        "action_dim": int(getattr(model, "action_dim", -1)),
+        "arm_action_dim": int(getattr(model, "arm_action_dim", -1)),
+        "hand_action_dim": int(getattr(model, "hand_action_dim", -1)),
+        "proprio_dim": int(getattr(model, "proprio_dim", -1)),
+    }
+    expected = {
+        "action_dim": DEXJOCO_ACTION_DIM,
+        "arm_action_dim": DEXJOCO_ARM_ACTION_DIM,
+        "hand_action_dim": DEXJOCO_HAND_ACTION_DIM,
+        "proprio_dim": DEXJOCO_PROPRIO_DIM,
+    }
+    if dimensions != expected:
+        raise ValueError(
+            "DexJoCo model dimensional contract mismatch: "
+            f"expected {expected}, got {dimensions}."
+        )
+    return dimensions
+
+
+def validate_dexjoco_training_checkpoint(
+    state_dir: str | Path,
+    model,
+    *,
+    require_production_statistics: bool = True,
+) -> dict:
+    """Validate the DexJoCo resume contract before loading any tensor state."""
+
+    dimensions = _dexjoco_dimensions(model)
+    if dimensions is None:
+        raise TypeError("DexJoCo checkpoint validation requires a dual-action model.")
+
+    root = Path(state_dir).expanduser().resolve()
+    manifest = _read_json_mapping(
+        root / DEXJOCO_TRAINING_MANIFEST,
+        "DexJoCo training checkpoint manifest",
+    )
+    if manifest.get("schema_name") != DEXJOCO_TRAINING_CHECKPOINT_SCHEMA:
+        raise ValueError(
+            "Invalid DexJoCo training checkpoint schema: "
+            f"expected {DEXJOCO_TRAINING_CHECKPOINT_SCHEMA!r}, "
+            f"got {manifest.get('schema_name')!r}."
+        )
+    if manifest.get("schema_version") != DEXJOCO_TRAINING_CHECKPOINT_VERSION:
+        raise ValueError(
+            "Invalid DexJoCo training checkpoint schema version: "
+            f"expected {DEXJOCO_TRAINING_CHECKPOINT_VERSION}, "
+            f"got {manifest.get('schema_version')!r}."
+        )
+    if manifest.get("dimensions") != dimensions:
+        raise ValueError(
+            "DexJoCo training checkpoint dimensions do not match the current model: "
+            f"expected {dimensions}, got {manifest.get('dimensions')}."
+        )
+
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise ValueError("DexJoCo training checkpoint manifest is missing `artifacts`.")
+    expected_artifacts = {
+        "training_config": DEXJOCO_TRAINING_CONFIG,
+        "dataset_statistics": DEXJOCO_DATASET_STATS,
+        "selective_loading_report": DEXJOCO_SELECTIVE_REPORT,
+    }
+    for key, expected_name in expected_artifacts.items():
+        if artifacts.get(key) != expected_name:
+            raise ValueError(
+                f"DexJoCo training checkpoint artifact `{key}` must be "
+                f"{expected_name!r}, got {artifacts.get(key)!r}."
+            )
+
+    config_path = root / DEXJOCO_TRAINING_CONFIG
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Missing DexJoCo resolved training config: {config_path}")
+    saved_config = OmegaConf.load(config_path)
+    saved_contract = OmegaConf.select(saved_config, "data.contract", default=None)
+    if saved_contract is not None:
+        saved_dimensions = {
+            key: int(saved_contract[key])
+            for key in dimensions
+            if key in saved_contract
+        }
+        if saved_dimensions != dimensions:
+            raise ValueError(
+                "DexJoCo saved training config dimensions do not match the checkpoint: "
+                f"expected {dimensions}, got {saved_dimensions}."
+            )
+
+    statistics = _read_json_mapping(
+        root / DEXJOCO_DATASET_STATS,
+        "DexJoCo dataset statistics",
+    )
+    validate_dexjoco_statistics(
+        statistics,
+        require_production=require_production_statistics,
+    )
+    selective_report = _read_json_mapping(
+        root / DEXJOCO_SELECTIVE_REPORT,
+        "DexJoCo selective loading report",
+    )
+    if selective_report.get("schema") != REPORT_SCHEMA:
+        raise ValueError(
+            "Invalid DexJoCo selective loading report schema: "
+            f"expected {REPORT_SCHEMA!r}, got {selective_report.get('schema')!r}."
+        )
+    if selective_report.get("version") != REPORT_VERSION:
+        raise ValueError(
+            "Invalid DexJoCo selective loading report version: "
+            f"expected {REPORT_VERSION}, got {selective_report.get('version')!r}."
+        )
+
+    components = manifest.get("training_state_components")
+    expected_components = {"model": True, "optimizer": True, "scheduler": True}
+    if components != expected_components:
+        raise ValueError(
+            "DexJoCo checkpoint must declare model/optimizer/scheduler training state: "
+            f"expected {expected_components}, got {components}."
+        )
+    state_files = artifacts.get("accelerate_state_files")
+    if not isinstance(state_files, list) or not state_files:
+        raise ValueError(
+            "DexJoCo checkpoint manifest must list its Accelerate state files."
+        )
+    for relative_path in state_files:
+        if not isinstance(relative_path, str):
+            raise ValueError("DexJoCo Accelerate state file entries must be strings.")
+        artifact_path = (root / relative_path).resolve()
+        if root not in artifact_path.parents or not artifact_path.is_file():
+            raise FileNotFoundError(
+                f"Missing or invalid DexJoCo Accelerate state artifact: {relative_path!r}."
+            )
+    return manifest
 
 
 def build_lr_scheduler(
@@ -692,6 +861,144 @@ class Wan22Trainer:
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=True, indent=2)
 
+    def _dexjoco_requires_production_statistics(self) -> bool:
+        allow_non_production = OmegaConf.select(
+            self.cfg,
+            "data.train.processor.allow_non_production_stats",
+            default=False,
+        )
+        return not bool(allow_non_production)
+
+    def _resolve_dexjoco_dataset_stats(self) -> Path:
+        candidates = [Path(self.output_dir) / DEXJOCO_DATASET_STATS]
+        configured = OmegaConf.select(
+            self.cfg,
+            "data.train.pretrained_norm_stats",
+            default=None,
+        )
+        if configured:
+            candidates.append(Path(str(configured)).expanduser())
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate.resolve()
+        raise FileNotFoundError(
+            "DexJoCo checkpoint saving requires dataset_stats.json from the training dataset; "
+            f"checked {[str(path) for path in candidates]}."
+        )
+
+    def _resolve_dexjoco_selective_report(self, model) -> tuple[dict, str]:
+        report = getattr(model, "selective_checkpoint_report", None)
+        if isinstance(report, Mapping):
+            return dict(report), "model.selective_checkpoint_report"
+        configured = OmegaConf.select(
+            self.cfg,
+            "model.selective_checkpoint_report_path",
+            default=None,
+        )
+        if configured:
+            path = Path(str(configured)).expanduser().resolve()
+            return _read_json_mapping(path, "DexJoCo selective loading report"), str(path)
+        raise FileNotFoundError(
+            "DexJoCo checkpoint saving requires the selective checkpoint loading report."
+        )
+
+    def _save_dexjoco_checkpoint_artifacts(
+        self,
+        state_path: str,
+        *,
+        weights_path: str | None,
+    ) -> Path | None:
+        model = self.accelerator.unwrap_model(self.model)
+        dimensions = _dexjoco_dimensions(model)
+        if dimensions is None:
+            return None
+
+        root = Path(state_path).resolve()
+        stats_source = self._resolve_dexjoco_dataset_stats()
+        statistics = _read_json_mapping(stats_source, "DexJoCo dataset statistics")
+        validate_dexjoco_statistics(
+            statistics,
+            require_production=self._dexjoco_requires_production_statistics(),
+        )
+        report, report_source = self._resolve_dexjoco_selective_report(model)
+        if report.get("schema") != REPORT_SCHEMA or report.get("version") != REPORT_VERSION:
+            raise ValueError(
+                "DexJoCo selective loading report has an incompatible schema/version: "
+                f"schema={report.get('schema')!r}, version={report.get('version')!r}."
+            )
+
+        stats_target = root / DEXJOCO_DATASET_STATS
+        if stats_source != stats_target:
+            shutil.copyfile(stats_source, stats_target)
+        _write_json(root / DEXJOCO_SELECTIVE_REPORT, report)
+        OmegaConf.save(
+            config=OmegaConf.create(OmegaConf.to_container(self.cfg, resolve=True)),
+            f=root / DEXJOCO_TRAINING_CONFIG,
+        )
+
+        state_files = sorted(
+            str(path.relative_to(root))
+            for path in root.rglob("*")
+            if path.is_file()
+            and path.name
+            not in {
+                DEXJOCO_TRAINING_MANIFEST,
+                DEXJOCO_TRAINING_CONFIG,
+                DEXJOCO_DATASET_STATS,
+                DEXJOCO_SELECTIVE_REPORT,
+                "trainer_state.json",
+            }
+        )
+        manifest = {
+            "schema_name": DEXJOCO_TRAINING_CHECKPOINT_SCHEMA,
+            "schema_version": DEXJOCO_TRAINING_CHECKPOINT_VERSION,
+            "dimensions": dimensions,
+            "training_state_components": {
+                "model": True,
+                "optimizer": True,
+                "scheduler": True,
+            },
+            "artifacts": {
+                "training_config": DEXJOCO_TRAINING_CONFIG,
+                "dataset_statistics": DEXJOCO_DATASET_STATS,
+                "selective_loading_report": DEXJOCO_SELECTIVE_REPORT,
+                "accelerate_state_files": state_files,
+                "weights_checkpoint": (
+                    None
+                    if weights_path is None
+                    else os.path.relpath(Path(weights_path).resolve(), start=root)
+                ),
+            },
+            "dataset_statistics_source": str(stats_source),
+            "dataset_statistics_schema": {
+                "schema_name": statistics.get("schema_name"),
+                "schema_version": statistics.get("schema_version"),
+                "statistics_mode": statistics.get("statistics_mode"),
+                "production": statistics.get("production"),
+            },
+            "selective_loading_report_source": report_source,
+            "selective_loading_report_schema": {
+                "schema": report.get("schema"),
+                "version": report.get("version"),
+            },
+        }
+        manifest_path = root / DEXJOCO_TRAINING_MANIFEST
+        _write_json(manifest_path, manifest)
+        validate_dexjoco_training_checkpoint(
+            root,
+            model,
+            require_production_statistics=self._dexjoco_requires_production_statistics(),
+        )
+        logger.info(
+            "Saved DexJoCo training checkpoint contract: manifest=%s stats=%s "
+            "selective_report=%s accelerate_files=%d",
+            manifest_path,
+            stats_target,
+            root / DEXJOCO_SELECTIVE_REPORT,
+            len(state_files),
+        )
+        return manifest_path
+
     def save_checkpoint(self):
         step_tag = f"step_{self.global_step:06d}"
 
@@ -703,14 +1010,51 @@ class Wan22Trainer:
 
         state_path = os.path.join(self.state_dir, step_tag)
         ensure_dir(state_path)
-        self.accelerator.save_state(output_dir=state_path)
+        model = self.accelerator.unwrap_model(self.model)
+        save_state_kwargs = {}
+        if _dexjoco_dimensions(model) is not None:
+            # The experts are also registered under MoT, so preserve their shared
+            # parameter aliases instead of letting safetensors discard duplicate keys.
+            save_state_kwargs["safe_serialization"] = False
+        self.accelerator.save_state(output_dir=state_path, **save_state_kwargs)
+        self.accelerator.wait_for_everyone()
         if self.accelerator.is_main_process:
+            self._save_dexjoco_checkpoint_artifacts(
+                state_path,
+                weights_path=ckpt_path,
+            )
             self._save_trainer_state(state_path)
         self.accelerator.wait_for_everyone()
 
         return {"weights_path": ckpt_path, "state_path": state_path}
 
     def load_training_state(self, state_dir: str):
+        model = self.accelerator.unwrap_model(self.model)
+        if _dexjoco_dimensions(model) is not None:
+            self.dexjoco_resume_manifest = validate_dexjoco_training_checkpoint(
+                state_dir,
+                model,
+                require_production_statistics=self._dexjoco_requires_production_statistics(),
+            )
+            active_stats_path = self._resolve_dexjoco_dataset_stats()
+            active_statistics = _read_json_mapping(
+                active_stats_path,
+                "active DexJoCo dataset statistics",
+            )
+            checkpoint_statistics = _read_json_mapping(
+                Path(state_dir) / DEXJOCO_DATASET_STATS,
+                "checkpoint DexJoCo dataset statistics",
+            )
+            if active_statistics != checkpoint_statistics:
+                raise ValueError(
+                    "Active DexJoCo dataset statistics do not exactly match the resume "
+                    f"checkpoint copy: active={active_stats_path}, "
+                    f"checkpoint={Path(state_dir) / DEXJOCO_DATASET_STATS}."
+                )
+            logger.info(
+                "Validated DexJoCo training checkpoint contract before tensor-state load: %s",
+                Path(state_dir) / DEXJOCO_TRAINING_MANIFEST,
+            )
         self.accelerator.load_state(input_dir=state_dir)
         state_file = Path(state_dir) / "trainer_state.json"
         if state_file.exists():

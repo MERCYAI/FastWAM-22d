@@ -660,6 +660,8 @@ class DexJoCoDualActionFastWAM(FastWAM):
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
         }
         if return_outputs:
+            outputs["target_action"] = target_action
+            outputs["timestep_action"] = timestep_action
             return loss_total, loss_dict, outputs
         return loss_total, loss_dict
 
