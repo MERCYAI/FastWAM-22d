@@ -680,9 +680,182 @@ class DexJoCoDualActionFastWAM(FastWAM):
         self._raise_cache_disabled()
 
     @torch.no_grad()
-    def infer_action(self, *args, **kwargs):
-        del args, kwargs
-        self._raise_cache_disabled()
+    def infer_action(
+        self,
+        prompt: Optional[str],
+        input_image: torch.Tensor,
+        action_horizon: int,
+        proprio: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        negative_prompt: Optional[str] = None,
+        text_cfg_scale: float = 1.0,
+        num_inference_steps: int = 20,
+        sigma_shift: Optional[float] = None,
+        seed: Optional[int] = None,
+        rand_device: str = "cpu",
+        tiled: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """Sample one complete 22D action chunk without the single-expert KV cache."""
+        self.eval()
+        if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
+            raise ValueError(
+                "DexJoCo `infer_action` requires "
+                "`video_attention_mask_mode='first_frame_causal'`."
+            )
+        if not isinstance(action_horizon, int) or isinstance(action_horizon, bool) or action_horizon <= 0:
+            raise ValueError("DexJoCo `action_horizon` must be a positive integer.")
+        if not isinstance(num_inference_steps, int) or num_inference_steps <= 0:
+            raise ValueError("DexJoCo `num_inference_steps` must be a positive integer.")
+        if negative_prompt not in (None, ""):
+            raise ValueError("DexJoCo uncached action inference does not support negative_prompt.")
+        if float(text_cfg_scale) != 1.0:
+            raise ValueError("DexJoCo uncached action inference requires text_cfg_scale=1.0.")
+
+        if input_image.ndim == 3:
+            input_image = input_image.unsqueeze(0)
+        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+            raise ValueError(
+                "DexJoCo `input_image` must have shape [1,3,H,W] or [3,H,W], "
+                f"got {tuple(input_image.shape)}."
+            )
+        if not input_image.is_floating_point():
+            raise TypeError(
+                f"DexJoCo `input_image` must use a floating dtype, got {input_image.dtype}."
+            )
+        if not torch.isfinite(input_image).all():
+            raise ValueError("DexJoCo `input_image` contains NaN or Inf.")
+        _, _, height, width = input_image.shape
+        if height % 16 != 0 or width % 16 != 0:
+            raise ValueError(
+                "DexJoCo `input_image` spatial dimensions must be multiples of 16, "
+                f"got HxW=({height},{width})."
+            )
+
+        if proprio is None:
+            raise ValueError("DexJoCo `proprio` is required for action inference.")
+        if proprio.ndim == 1:
+            proprio = proprio.unsqueeze(0)
+        if proprio.ndim != 2 or proprio.shape != (1, self.PROPRIO_DIM):
+            raise ValueError(
+                f"DexJoCo `proprio` must have shape [1,{self.PROPRIO_DIM}] or "
+                f"[{self.PROPRIO_DIM}], got {tuple(proprio.shape)}."
+            )
+        if not proprio.is_floating_point():
+            raise TypeError(f"DexJoCo `proprio` must use a floating dtype, got {proprio.dtype}.")
+        if not torch.isfinite(proprio).all():
+            raise ValueError("DexJoCo `proprio` contains NaN or Inf.")
+
+        use_prompt = prompt is not None
+        use_context = context is not None or context_mask is not None
+        if use_prompt and use_context:
+            raise ValueError("DexJoCo `prompt` and `context/context_mask` are mutually exclusive.")
+        if not use_prompt and not use_context:
+            raise ValueError("Provide either `prompt` or both `context/context_mask`.")
+        if use_prompt:
+            if not isinstance(prompt, str) or not prompt.strip():
+                raise ValueError("DexJoCo `prompt` must be a non-empty string.")
+            context, context_mask = self.encode_prompt(prompt)
+        else:
+            if context is None or context_mask is None:
+                raise ValueError("DexJoCo `context` and `context_mask` must be provided together.")
+            if context.ndim == 2:
+                context = context.unsqueeze(0)
+            if context_mask.ndim == 1:
+                context_mask = context_mask.unsqueeze(0)
+            if context.ndim != 3 or context.shape[0] != 1:
+                raise ValueError(
+                    "DexJoCo `context` must have shape [1,L,D] or [L,D], "
+                    f"got {tuple(context.shape)}."
+                )
+            if context_mask.ndim != 2 or context_mask.shape != context.shape[:2]:
+                raise ValueError(
+                    "DexJoCo `context_mask` must match context [1,L], "
+                    f"got {tuple(context_mask.shape)} for {tuple(context.shape)}."
+                )
+            if not context.is_floating_point() or not torch.isfinite(context).all():
+                raise ValueError("DexJoCo `context` must be finite floating point.")
+            context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+            context_mask = context_mask.to(
+                device=self.device, dtype=torch.bool, non_blocking=True
+            )
+
+        proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
+        context, context_mask = self._append_proprio_to_context(
+            context=context,
+            context_mask=context_mask,
+            proprio=proprio,
+        )
+        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+        first_frame_latents = self._encode_input_image_latents_tensor(
+            input_image=input_image,
+            tiled=tiled,
+        )
+        if not torch.isfinite(first_frame_latents).all():
+            raise RuntimeError("DexJoCo VAE produced NaN or Inf first-frame latents.")
+
+        generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
+        latents_action = torch.randn(
+            (1, action_horizon, self.ACTION_DIM),
+            generator=generator,
+            device=rand_device,
+            dtype=torch.float32,
+        ).to(device=self.device, dtype=self.torch_dtype)
+        timestep_video = torch.zeros(
+            (1,),
+            dtype=first_frame_latents.dtype,
+            device=self.device,
+        )
+        fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
+        infer_timesteps, infer_deltas = self.infer_action_scheduler.build_inference_schedule(
+            num_inference_steps=num_inference_steps,
+            device=self.device,
+            dtype=latents_action.dtype,
+            shift_override=sigma_shift,
+        )
+
+        last_outputs = None
+        for step_t, step_delta in zip(infer_timesteps, infer_deltas):
+            timestep_action = step_t.reshape(1).to(
+                dtype=latents_action.dtype,
+                device=self.device,
+            )
+            last_outputs = self._forward_dual_experts(
+                latents_video=first_frame_latents,
+                noisy_action=latents_action,
+                timestep_video=timestep_video,
+                timestep_action=timestep_action,
+                context=context,
+                context_mask=context_mask,
+                action_condition=None,
+                fuse_vae_embedding_in_latents=fuse_flag,
+            )
+            prediction = last_outputs["action"]
+            expected_shape = (1, action_horizon, self.ACTION_DIM)
+            if prediction.shape != expected_shape:
+                raise RuntimeError(
+                    f"DexJoCo model output must have shape {expected_shape}, "
+                    f"got {tuple(prediction.shape)}."
+                )
+            if not torch.isfinite(prediction).all():
+                raise RuntimeError("DexJoCo model produced NaN or Inf action noise.")
+            latents_action = self.infer_action_scheduler.step(
+                prediction,
+                step_delta,
+                latents_action,
+            )
+
+        if last_outputs is None:
+            raise RuntimeError("DexJoCo inference schedule produced no denoising steps.")
+        if not torch.isfinite(latents_action).all():
+            raise RuntimeError("DexJoCo sampler produced NaN or Inf actions.")
+        arm_action, hand_action = self.split_action(latents_action)
+        return {
+            "action": latents_action.detach().to(device="cpu", dtype=torch.float32),
+            "arm_action": arm_action.detach().to(device="cpu", dtype=torch.float32),
+            "hand_action": hand_action.detach().to(device="cpu", dtype=torch.float32),
+            "attention_mask": last_outputs["attention_mask"].detach().to(device="cpu"),
+        }
 
     def _raise_phase2_joint_inference_disabled(self) -> None:
         message = (

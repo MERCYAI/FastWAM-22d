@@ -155,3 +155,35 @@
 - 决策：配置 `selective_checkpoint_path` 后跳过单独的 Wan Video DiT 和预处理 ActionDiT backbone 加载；同一 checkpoint 的 Video key 加载到 Video、Action key 加载到 Arm 并显式 remap 到 Hand。
 - 理由：这保证审计报告能完整说明三个目标 backbone 的来源，也避免在 selective load 前依赖仓库中当前不存在的 `ActionDiT_linear_interp_*.pt`。
 - 边界：VAE 和可选 text encoder 仍由现有 Wan 组件 loader 管理，不属于 Phase 3 selective policy。
+
+## D-0021：Phase 6 action inference 使用显式无 cache 三 expert forward
+
+- 日期：2026-08-15
+- 状态：Accepted
+- 决策：每个 denoising step 用完整 `[1,T,22]` latent 调用 `_forward_dual_experts()`，Arm/Hand 共享 timestep/scheduler，完整 22D prediction 只 step 一次；旧 `_predict_action_noise_with_cache()` 继续 fail-fast。
+- 理由：现有 KV cache 只更新 `action` expert，无法表达 Hand token 或 Arm/Hand 双向 interaction。无 cache 虽较慢，但不会静默改变 Phase 2 attention 契约。
+- 边界：`infer_joint()` 仍禁用；Phase 6 server 只提供 action chunk。
+
+## D-0022：Websocket 和 statistics 使用双重 versioned contract
+
+- 日期：2026-08-15
+- 状态：Accepted
+- 决策：wire schema 固定为 `fastwam.dexjoco.websocket@1`，response 强制 exact 22D ordering；normalizer 只接受 `fastwam.dexjoco.dataset_stats@1` 并默认要求 production training-split statistics。
+- 理由：仅凭 output dimension 无法排除 LIBERO 7D statistics、错误 actuator ordering 或错误 action semantics。
+- 影响：server 从 checkpoint state directory 使用其 `dataset_stats.json`；smoke stats 只有显式 flag 才可加载。
+
+## D-0023：Inference 只读取预计算 T5 cache
+
+- 日期：2026-08-15
+- 状态：Accepted
+- 决策：server 按训练 `DEFAULT_PROMPT` 和 exact SHA256 filename 读取 `scripts/precompute_text_embeds.py` payload，缺失即 fail-fast；不加载或回退到 T5 encoder。
+- 理由：T5 在训练策略中 frozen，独立加载会增加 server 显存且可能因 prompt 模板/encoder id 不一致产生不同 conditioning。
+- 影响：precompute script 同时支持 LeRobot v3 `tasks.parquet` 和旧 `tasks.jsonl`；部署前必须生成所有评测 prompt cache。
+
+## D-0024：Simulator clipping 以运行时 actuator range 为准
+
+- 日期：2026-08-15
+- 状态：Accepted
+- 决策：rotvec 用 SciPy 转为 `quaternion_wxyz`；Hand 16D 从 `_allegro_ctrl_ids` 对应的 MuJoCo `actuator_ctrlrange` clipping；未声明通用 Cartesian workspace 时 xyz 不做虚构范围 clipping。
+- 证据：现有 DexJoCo wrapper 使用 `as_quat(scalar_first=True)`，raw environment 按 `w,qx,qy,qz` 解包。
+- 影响：可在六任务 YAML 中显式设置 `xyz_min/xyz_max`，但默认均为 null。

@@ -26,8 +26,11 @@ class TinyVAE(nn.Module):
             video = torch.stack(video)
         spatial = F.avg_pool3d(video, kernel_size=(1, 8, 8), stride=(1, 8, 8))
         first = spatial[:, :, :1]
-        tail = spatial[:, :, 1:].mean(dim=2, keepdim=True)
-        latent = torch.cat([first, tail], dim=2)
+        if spatial.shape[2] > 1:
+            tail = spatial[:, :, 1:].mean(dim=2, keepdim=True)
+            latent = torch.cat([first, tail], dim=2)
+        else:
+            latent = first
         return torch.cat([latent, latent.mean(dim=1, keepdim=True)], dim=1)
 
 
@@ -162,11 +165,11 @@ def main() -> None:
     assert model.supports_video_kv_cache is False
 
     try:
-        model.infer_action()
+        model._predict_action_noise_with_cache()
     except NotImplementedError as exc:
         assert "cache" in str(exc).lower()
     else:
-        raise AssertionError("DexJoCo cached inference must fail explicitly in Phase 2")
+        raise AssertionError("DexJoCo single-action cache must remain disabled")
 
     libero_video = make_video_expert(action_dim=7)
     libero_action = make_action_expert(7)
@@ -199,7 +202,7 @@ def main() -> None:
     )
     print(f"attention_mask={tuple(outputs['attention_mask'].shape)}")
     print("action scheduler: timestep_calls=1 add_noise_shape=(1, 4, 22)")
-    print("proprio_encoder.in_features=23 video_kv_cache=disabled-explicit")
+    print("proprio_encoder.in_features=23 single-action video_kv_cache=disabled-explicit")
     print("legacy FastWAM: experts=('video', 'action') action_dim=7 instantiate=PASS")
 
 

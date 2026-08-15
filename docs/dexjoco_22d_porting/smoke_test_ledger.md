@@ -196,3 +196,32 @@
 - 风险：T5 context 为合成零 cache；persistent 数据根仍缺 `click_mouse`/`pinch_tongs`；production statistics 未生成；双 expert inference/cache 仍禁用。
 - 门槛：补齐六任务数据；不带 episode limit 计算 production training-split stats；生成真实 T5 cache；在目标 DeepSpeed 配置上先做 1-step 5B save/resume；之后才能授权正式训练。
 - 计划 commit message：`feat(train): close DexJoCo 22d training loop`
+
+## Phase 6 - 2026-08-15
+
+阶段目标：建立 FastWAM 双相机/23D state/cached T5 websocket inference server，以及 DexJoCo 22D action client、23D simulator command adapter 和 action chunk/replan 闭环。边界是 tiny CPU websocket 请求与 `water_plant` reset + 2 steps，不加载正式 5B joint-trained 权重，不执行六任务完整评测。
+
+| ID | 检查 | 范围/方法 | 结果 | 证据或限制 |
+| --- | --- | --- | --- | --- |
+| P6-01 | 阶段 Git 基线 | 两仓库 status/branch/HEAD；补录 Phase 5 hash | PASS | FastWAM `main@88c04006...` 干净；DexJoCo `main@8d23b0fa...` 仅两个受保护用户修改；Phase 5 hash 已回填。 |
+| P6-02 | DexJoCo client 提交 | 精确 stage client/adapter/config/smoke 文件 | PASS | `992abca3da2bb34475485658bf76b766c49b7efa`；后续 protocol-only lazy import fix 为 `3c85e48dc50c29e204259261eb97f3419e26e969`。 |
+| P6-03 | Websocket 协议 | 真实 DexJoCo `FastWAMWebsocketClient` 请求本地 ephemeral server | PASS | `fastwam.dexjoco.websocket@1`；binary msgpack NumPy；request cameras HWC uint8、state `[23]`，response `[4,22]` float32 finite。 |
+| P6-04 | 双相机预处理 | primary/wrist `[18,20,3]` resize/concat | PASS | 每路 resize `[3,16,16]`，模型输入 `[1,3,16,32]`，顺序 primary 后 wrist。 |
+| P6-05 | State/statistics | 23D normalize + checkpoint stats contract | PASS | normalize finite；默认拒绝 production=false；伪造 LIBERO schema/action_dim=7 在 policy 建立前失败。 |
+| P6-06 | Cached T5 | exact prompt template/SHA256/cache payload | PASS | cache hit shape `[1,3,32]`；缺 cache fail-fast，不加载 T5；六任务 `tasks.parquet` prompt discovery PASS。 |
+| P6-07 | 双 Expert sampler | tiny Video/Arm/Hand/MoT，2 个无 cache denoising steps | PASS | model action `[1,4,22]`、Arm `[1,4,6]`、Hand `[1,4,16]`；scheduler 每步只接收 `[1,4,22]`。 |
+| P6-08 | Attention/cache | mask 审计及旧 cache 入口 | PASS | mask `[16,16]`；Video 不读动作，Arm/Hand 读 Video 且双向交互；旧 single-action cache 继续显式 fail-fast。 |
+| P6-09 | Server 输出 | 拼接一致性、22D denormalization、wire 校验 | PASS | Arm/Hand 必须精确拼回 joint action；wire `[4,22]` finite float32；没有使用 LIBERO 7D denormalizer。 |
+| P6-10 | 异常输入 | schema/batch/horizon/image/state/dtype/NaN/拼接不一致 | EXPECTED FAIL | 所有错误均被协议或 policy 显式拒绝，不广播、不截断。 |
+| P6-11 | Quaternion 数值 | SciPy rotvec -> `scalar_first=True` quaternion | PASS | 零旋转得到 wxyz `(1,0,0,0)`；x 轴 pi 得到绝对值 `(0,1,0,0)`。 |
+| P6-12 | Simulator control | `water_plant` reset + 2 steps | PASS/NO SUCCESS REQUIRED | 最终 `environment.step()` command `[23]` finite；success=false；不属于任务成功评测。 |
+| P6-13 | Clipping/chunk/video | runtime actuator ctrlrange；H=4，replan=0.5；临时 MP4 | PASS | 16D Hand 依据 MuJoCo actuator IDs/range clipping；1 次 request 执行 2 steps；`front.mp4`/`wrist.mp4` 均生成后随临时目录删除。 |
+| P6-14 | Phase 2-5 回归 | dual action/selective checkpoint/optimizer/training smoke | PASS | Phase 5 loss 仍为 total/video/action `4.11274576/2.52383971/1.58890617`；save/reload 和 resume fail-fast PASS。 |
+| P6-15 | 正式部署 | 5B checkpoint/server/六任务完整评测 | NOT RUN | 缺持久 joint-trained state directory、production DexJoCo stats 和 T5 cache；仓库现有 LIBERO checkpoint 必须被拒绝。 |
+
+### Phase 6 风险和正式部署门槛
+
+- 风险：无 cache sampler 每个 diffusion step 重算 Video/Arm/Hand，tiny CPU smoke 不代表 5B CUDA 显存、吞吐或 latency。
+- 风险：只验证单连接 request/reply 和一个任务的两步模拟；认证、并发、长连接、完整 episode 与六任务成功率尚未覆盖。
+- 门槛：完整 training split production statistics、真实六任务 T5 cache 和 joint-trained Phase 5 state directory 就绪；先进行目标 GPU 的短 server/client smoke，再授权完整评测。
+- 计划 FastWAM commit message：`feat(inference): serve DexJoCo 22d actions`

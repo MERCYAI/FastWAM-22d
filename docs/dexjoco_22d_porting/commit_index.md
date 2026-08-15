@@ -9,7 +9,10 @@
 | Phase 2 | 2026-08-15 | 已提交 | `03caff2af53632914ec7418716480b7a5ae6dbdc` | `feat(model): add dual action experts for DexJoCo` | DexJoCo Video/Arm/Hand 三 expert MoT、22D action loss、23D proprio、专用 mask/cache fail-fast 和 tiny smoke |
 | Phase 3 | 2026-08-15 | 已提交 | `9854c30685985b371c890b6db7f777e50ed1e6d7` | `feat(checkpoint): add selective DexJoCo weight loading` | 精确 checkpoint key 分类、Video/Arm 加载、Action-to-Hand remap、新 projection 初始化、JSON 报告和 targeted smoke |
 | Phase 4 | 2026-08-15 | 已提交 | `43f450641504ee0b0609511e0ca372a7c910f433` | `feat(train): add DexJoCo parameter groups` | DexJoCo joint post-training 冻结策略、三组 optimizer、保持 LR 比例的 scheduler 和 targeted smoke |
-| Phase 5 | 2026-08-15 | 本文件所在提交 | self | `feat(train): close DexJoCo 22d training loop` | 六任务单步 joint training、梯度/更新审计、版本化 checkpoint artifacts、resume fail-fast 和 save/reload smoke |
+| Phase 5 | 2026-08-15 | 已提交 | `88c040066d6618dd24443ee0965673497df035c3` | `feat(train): close DexJoCo 22d training loop` | 六任务单步 joint training、梯度/更新审计、版本化 checkpoint artifacts、resume fail-fast 和 save/reload smoke |
+| Phase 6 DexJoCo | 2026-08-15 | 已提交 | `992abca3da2bb34475485658bf76b766c49b7efa` | `feat(eval): add FastWAM DexJoCo client` | 六任务 client config、22D websocket/action adapter、23D simulator command、chunk/replan 和短 simulator smoke |
+| Phase 6 DexJoCo import fix | 2026-08-15 | 已提交 | `3c85e48dc50c29e204259261eb97f3419e26e969` | `fix(eval): lazy-load DexJoCo simulator adapter` | protocol-only client 惰性加载 simulator 依赖，支持跨仓库 websocket smoke |
+| Phase 6 FastWAM | 2026-08-15 | 本文件所在提交 | self | `feat(inference): serve DexJoCo 22d actions` | 无 cache 双 Action Expert sampler、strict websocket server、stats/T5 cache/checkpoint policy 和 targeted smoke |
 
 ## Phase 0 提交边界
 
@@ -57,4 +60,12 @@
 - DexJoCo 参考 HEAD：`8d23b0fab23b17a58c4b55f3942e17013aaf8267`，不在该提交中修改。
 - 只 stage trainer checkpoint/resume 契约、dual-action smoke 可观测输出、Phase 5 targeted smoke 和本目录 Phase 5 记录。
 - 不 stage `checkpoints/libero_uncond_2cam224.pt`、`/tmp` 数据/statistics/checkpoint、训练输出或 DexJoCo 用户文件。
+- 提交前必须通过 `git diff --cached --check`，并人工复核 `git diff --cached --stat` 和 `git diff --cached`。
+
+## Phase 6 提交边界
+
+- FastWAM 起始 HEAD：`88c040066d6618dd24443ee0965673497df035c3`。
+- DexJoCo client commits：`992abca3da2bb34475485658bf76b766c49b7efa`、`3c85e48dc50c29e204259261eb97f3419e26e969`。
+- FastWAM 只 stage inference package、DexJoCo uncached sampler、server/precompute/smoke scripts、依赖声明和本目录 Phase 6 记录。
+- 不 stage checkpoint、statistics、T5 cache、simulator video、训练/评测输出或 DexJoCo 用户文件。
 - 提交前必须通过 `git diff --cached --check`，并人工复核 `git diff --cached --stat` 和 `git diff --cached`。

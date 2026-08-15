@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import hydra
+import pyarrow.parquet as pq
 import torch
 import torch.distributed as dist
 from omegaconf import DictConfig, ListConfig
@@ -117,24 +118,49 @@ def _read_unique_prompts(dataset_dirs: list[str]) -> list[str]:
     total_task_rows = 0
 
     for ds_dir in dataset_dirs:
-        tasks_path = Path(ds_dir) / "meta" / "tasks.jsonl"
-        if not tasks_path.exists():
-            raise FileNotFoundError(f"Missing tasks file: {tasks_path}")
+        meta_dir = Path(ds_dir) / "meta"
+        jsonl_path = meta_dir / "tasks.jsonl"
+        parquet_path = meta_dir / "tasks.parquet"
+        tasks: list[str] = []
+        if jsonl_path.is_file():
+            with jsonl_path.open("r", encoding="utf-8") as f:
+                for line_idx, line in enumerate(f, start=1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    record = json.loads(line)
+                    if "task" not in record:
+                        raise KeyError(f"Missing `task` field at {jsonl_path}:{line_idx}")
+                    tasks.append(str(record["task"]))
+        elif parquet_path.is_file():
+            table = pq.read_table(parquet_path)
+            task_column = next(
+                (
+                    name
+                    for name in ("task", "__index_level_0__")
+                    if name in table.column_names
+                ),
+                None,
+            )
+            if task_column is None:
+                raise KeyError(
+                    f"Missing task text column in {parquet_path}; "
+                    f"columns={table.column_names}."
+                )
+            tasks = [str(task) for task in table[task_column].to_pylist()]
+        else:
+            raise FileNotFoundError(
+                f"Missing tasks.jsonl/tasks.parquet under dataset metadata: {meta_dir}"
+            )
 
-        with tasks_path.open("r", encoding="utf-8") as f:
-            for line_idx, line in enumerate(f, start=1):
-                line = line.strip()
-                if not line:
-                    continue
-                record = json.loads(line)
-                if "task" not in record:
-                    raise KeyError(f"Missing `task` field at {tasks_path}:{line_idx}")
-                task = str(record["task"])
-                prompt = DEFAULT_PROMPT.format(task=task)
-                total_task_rows += 1
-                if prompt not in seen:
-                    seen.add(prompt)
-                    prompts.append(prompt)
+        for task in tasks:
+            if not task.strip():
+                raise ValueError(f"Empty task text in dataset metadata: {meta_dir}")
+            prompt = DEFAULT_PROMPT.format(task=task)
+            total_task_rows += 1
+            if prompt not in seen:
+                seen.add(prompt)
+                prompts.append(prompt)
 
     logger.info(
         "Loaded %d task rows from %d datasets, deduplicated to %d prompts.",
