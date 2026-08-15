@@ -41,3 +41,44 @@
 - 风险：视频只验证 metadata/锁步逻辑；两任务样本不是本地持久副本；30 FPS 数据频率与 50 Hz 默认环境控制频率需明确衔接；22D/23D statistics 尚未验证。
 - 下一阶段门槛：明确双专家结构、mask/cache、checkpoint remap 和新 projection 初始化规则；在获授权后增加针对 22D/23D 的单元及 runtime smoke tests。
 - 计划 commit message：`docs: record DexJoCo 22d adaptation contract`
+
+## Phase 1 - 2026-08-15
+
+阶段目标：验证 DexJoCo 专用 LeRobot v3 路径、六任务 22D/23D batch、双相机像素解码、padding/mask 和 versioned normalization。阶段边界是不执行全量 statistics、训练、模型推理或 simulator。
+
+| ID | 检查 | 范围/方法 | 结果 | 证据或限制 |
+| --- | --- | --- | --- | --- |
+| P1-01 | 阶段 Git 基线 | 两仓库 `status`/branch/HEAD；读取 Phase 0 全部记录 | PASS | FastWAM `main@835c98b8...` 干净；DexJoCo `main@8d23b0fa...` 两个用户修改保持原样。 |
+| P1-02 | 原 LeRobot reader 兼容性 | 用真实 `water_plant` 初始化内置 metadata reader | EXPECTED FAIL | reader 查找 v2 `meta/tasks.jsonl`，而数据为 v3 `meta/tasks.parquet` 和 file-level 分片；据此使用专用 backend。 |
+| P1-03 | v3 低维映射 | `DexJoCoV3TaskSource.load_episode_low_dim()` 读取 episode 0 | PASS | `water_plant` 得到 action `[309,22]` float32、state `[309,23]` float32；episode_index 行区间一致。 |
+| P1-04 | AV1 像素解码 | torchcodec 读取真实 `file-000.mp4` | PASS | 输出 `[N,3,640,640]` uint8；六任务正式 smoke 均实际解码两路视频。 |
+| P1-05 | 六任务 DataLoader shape | `scripts/smoke_test_dexjoco_data.py --num-workers 2`，每任务 episode 0 首 clip | PASS | 每任务均为 action `[1,32,22]`、arm `[1,32,6]`、hand `[1,32,16]`、state `[1,32,23]`、cameras `[1,2,3,9,224,224]`、video `[1,3,9,224,448]`。 |
+| P1-06 | 相机 alias | 六任务 batch + source metadata | PASS | `click_mouse` 映射 `ego_right,wrist`；其余为 `front,wrist`；公开顺序统一 `primary,wrist`。 |
+| P1-07 | padding/mask 边界 | `water_plant` episode 0 最后一帧起始 clip | PASS | action pad `31/32`、state pad `31/32`、image pad `8/9`，mask 分别与输出时间轴对齐。 |
+| P1-08 | 限量 statistics CLI | 六任务各 1 episode | PASS | 6 episodes / 2449 frames；`schema@1`、`mode=smoke`、`production=False`、`split=train`。 |
+| P1-09 | normalization round trip | 真实 `water_plant` 少量 action/state | PASS | 最大绝对误差 action `5.960e-08`、state `1.192e-07`。 |
+| P1-10 | 零/近零方差处理 | 标准库单元测试 synthetic constant dimension | PASS | std clamp 到 `1e-6`；触发维度被记录。 |
+| P1-11 | stats 防误读 | schema/version/production/ordering/dim/shape validator 单元测试 | PASS | production 路径拒绝 smoke；缺 schema 的 LIBERO 形态直接报错。 |
+| P1-12 | Hydra 真实入口 | `data=dexjoco_6task_2cam` compose + instantiate | PASS | `DexJoCoRobotVideoDataset` -> `DexJoCoV3Dataset`，临时六任务根共 218993 frames。 |
+| P1-13 | 多 worker | 六任务 DataLoader `num_workers=2` | PASS | 六个 batch 全部成功，decoder/Parquet cache 可在 worker 路径使用。 |
+| P1-14 | 聚焦测试/语法 | `python tests/test_dexjoco_data.py`、`compileall`、`git diff --check` | PASS | 3 个标准库测试通过；编译和 whitespace 检查通过。环境未安装 pytest，因此测试不依赖 pytest。 |
+| P1-15 | 完整 training statistics | 未运行 | NOT RUN | 本机持久根缺两任务；本阶段明确不扫描完整 split。 |
+| P1-16 | 训练/模型推理/checkpoint | 未运行 | NOT RUN | 超出 Phase 1 边界。 |
+| P1-17 | DexJoCo simulator | 未运行 | NOT RUN | 超出 Phase 1 边界。 |
+
+### Phase 1 六任务输出账本
+
+| 任务 | 数据来源 | action | arm | hand | state | 两路 camera | 拼接 video |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `water_plant` | 本地持久数据 | `[1,32,22]` | `[1,32,6]` | `[1,32,16]` | `[1,32,23]` | `[1,2,3,9,224,224]` | `[1,3,9,224,448]` |
+| `hammer_nail` | 本地持久数据 | `[1,32,22]` | `[1,32,6]` | `[1,32,16]` | `[1,32,23]` | `[1,2,3,9,224,224]` | `[1,3,9,224,448]` |
+| `click_mouse` | 官方 HF 临时最小视频/低维文件 | `[1,32,22]` | `[1,32,6]` | `[1,32,16]` | `[1,32,23]` | `[1,2,3,9,224,224]` | `[1,3,9,224,448]` |
+| `pick_bucket` | 本地持久数据 | `[1,32,22]` | `[1,32,6]` | `[1,32,16]` | `[1,32,23]` | `[1,2,3,9,224,224]` | `[1,3,9,224,448]` |
+| `pinch_tongs` | 官方 HF 临时最小视频/低维文件 | `[1,32,22]` | `[1,32,6]` | `[1,32,16]` | `[1,32,23]` | `[1,2,3,9,224,224]` | `[1,3,9,224,448]` |
+| `fold_glasses` | 本地持久数据 | `[1,32,22]` | `[1,32,6]` | `[1,32,16]` | `[1,32,23]` | `[1,2,3,9,224,224]` | `[1,3,9,224,448]` |
+
+### Phase 1 风险和下一阶段门槛
+
+- 风险：持久六任务数据和 production statistics 尚未就绪；真实 T5 cache 尚未生成；30 FPS 数据到 50 Hz simulator 的 runtime 连接仍待后续确认。
+- 门槛：补齐 `click_mouse`/`pinch_tongs`，无 episode limit 生成并保存 production `dataset_stats.json`，生成真实 text embeddings；本阶段提交完成后需获得下一阶段明确授权。
+- 计划 commit message：`feat(data): add DexJoCo 22d action pipeline`

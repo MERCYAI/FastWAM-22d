@@ -42,10 +42,16 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
+        return_camera_videos: bool = False,
     ):
-        self.lerobot_dataset = BaseLerobotDataset(
+        plain_shape_meta = (
+            OmegaConf.to_container(shape_meta, resolve=True)
+            if OmegaConf.is_config(shape_meta)
+            else shape_meta
+        )
+        self.lerobot_dataset = self._build_lerobot_dataset(
             dataset_dirs=dataset_dirs,
-            shape_meta=OmegaConf.to_container(shape_meta, resolve=True),
+            shape_meta=plain_shape_meta,
             obs_size=num_frames,
             action_size=num_frames - 1,
             val_set_proportion=val_set_proportion,
@@ -72,6 +78,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.max_padding_retry = max_padding_retry
         self.concat_multi_camera = concat_multi_camera
         self.override_instruction = override_instruction
+        self.return_camera_videos = return_camera_videos
 
         self.resize_transform = ResizeSmallestSideAspectPreserving(
             args={"img_w": self.video_size[1], "img_h": self.video_size[0]},
@@ -108,6 +115,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
             processor.set_normalizer_from_stats(dataset_stats)
             self.lerobot_dataset.set_processor(processor)
+
+    def _build_lerobot_dataset(self, **kwargs):
+        return BaseLerobotDataset(**kwargs)
         
     def __len__(self):
         return len(self.lerobot_dataset)
@@ -151,6 +161,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         image_is_pad = image_is_pad[self.video_sample_indices]
 
         video = video.view(num_cameras, T_video, C, H, W)  # [num_cameras, T_video, C, H, W]
+        camera_videos = None
+        if self.return_camera_videos:
+            camera_videos = self.normalize_transform(video)
+            camera_videos = camera_videos.permute(0, 2, 1, 3, 4)
         if self.concat_multi_camera == "robotwin":
             if num_cameras != 3:
                 raise ValueError(
@@ -231,6 +245,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "action_is_pad": sample["action_is_pad"],
             "proprio_is_pad": sample["proprio_is_pad"],
         }
+        if camera_videos is not None:
+            data["camera_videos"] = camera_videos
+        for metadata_key in ("task_name", "episode_index"):
+            if metadata_key in sample:
+                data[metadata_key] = sample[metadata_key]
         return data
 
     def _get_cached_text_context(self, prompt: str):

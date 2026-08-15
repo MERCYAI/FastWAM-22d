@@ -6,6 +6,8 @@
 
 Phase 0 只做仓库审计、轻量数据抽样、动作/状态契约冻结和记录初始化；不修改模型、数据、训练或推理代码，也不运行训练、推理或仿真闭环。
 
+Phase 1 增加 DexJoCo LeRobot v3 六任务数据路径、22D/23D processor 和 versioned normalization statistics；不修改模型结构或训练/推理算法。
+
 ## 任务范围
 
 项目覆盖以下六个 DexJoCo 任务：
@@ -34,6 +36,7 @@ Phase 0 开始时 FastWAM 工作树干净。DexJoCo 工作树已有以下用户�
 ## 记录文件
 
 - `00_audit_and_contract.md`：Phase 0 的仓库、代码、数据和模拟器审计，以及冻结的 22D 正式契约。
+- `01_data_and_normalization.md`：Phase 1 的 v3 数据入口、batch 契约、normalization schema、命令、smoke 结果和风险。
 - `decisions.md`：跨阶段技术决策及其证据、影响和变更条件。
 - `smoke_test_ledger.md`：按阶段记录轻量检查、smoke test、未运行项和结果证据。
 - `commit_index.md`：按阶段记录提交目的、范围和 commit message；提交 hash 由该条目所在 Git 历史确定。

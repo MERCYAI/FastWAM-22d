@@ -52,3 +52,43 @@
 - 状态：Accepted
 - 决策：只 stage `docs/dexjoco_22d_porting/` 下五个文件。
 - 约束：不修改或 stage DexJoCo 的 `environment-dexjoco.yaml` 和 `openpi/packages/openpi-client/pyproject.toml`；保留所有用户改动。
+
+## D-0008：DexJoCo 使用专用 LeRobot v3 backend
+
+- 日期：2026-08-15
+- 状态：Accepted
+- 决策：新增 `DexJoCoV3Dataset`/`DexJoCoV3TaskSource`，按 `meta/episodes` 的行区间和每路视频 file/timestamp 映射读取；不改用 FastWAM 原有 v2 backend。
+- 证据：六任务 `codebase_version` 均为 `v3.0`，共享 file-level Parquet/MP4；原 backend 对真实 `water_plant` 首先尝试读取不存在的 `meta/tasks.jsonl`。
+- 影响：LIBERO/FastWAM 原路径默认行为不变；DexJoCo loader 对 v3 schema、30 FPS、任务目录顺序和 22D/23D feature 做 fail-fast 校验。
+
+## D-0009：双相机对外统一为 `primary,wrist`
+
+- 日期：2026-08-15
+- 状态：Accepted
+- 决策：公开 `camera_videos` 顺序固定为 `primary,wrist`；`click_mouse.primary=ego_right`，其余五任务 `primary=front`。
+- 理由：直接把六目录交给原 `MultiLeRobotDataset` 会只保留公共 feature，`front`/`ego_right` 不可能同时成为公共 key；alias 保持固定训练接口且不伪造源 metadata。
+- 约束：两路视频分别使用自己的 file index 和相对 timestamp，因为 v3 的视频文件可在不同 episode 边界独立切分；每路 duration 必须匹配 episode frame count。
+
+## D-0010：DexJoCo statistics 使用独立、严格的 versioned schema
+
+- 日期：2026-08-15
+- 状态：Accepted
+- 决策：schema 固定为 `fastwam.dexjoco.dataset_stats@1`，记录 training split、六任务/字段/执行器 ordering、22/6/16/23 维、action horizon、计数、std floor 和 FastWAM 所需 global/stepwise statistics。
+- 约束：带 episode limit 的输出自动标为 `statistics_mode=smoke`、`production=false`；processor 默认拒绝 smoke、LIBERO、版本/顺序/shape 不匹配的文件。
+- 数值策略：小于 `1e-6` 的 std clamp 到 `1e-6` 并记录维度，避免 z-score 对零方差或近零方差维放大。
+
+## D-0011：DexJoCo 禁用 delta action 并显式拆分 arm/hand view
+
+- 日期：2026-08-15
+- 状态：Accepted
+- 决策：`DexJoCoFastWAMProcessor` 强制 `delta_action_dim_mask=None`；dataset 在完整归一化 action 上提供 `arm_action=action[..., :6]` 和 `hand_action=action[..., 6:22]`。
+- 理由：Phase 0 已由 recorder/client/simulator 交叉确认 action 是绝对 TCP target；LIBERO 的 7D delta mask 语义不适用。
+- 影响：完整 action、拆分 view、proprio 及其 padding mask 均按 `[B,T,D]` 对齐；现有模型仍消费拼接 `video`，独立双相机张量作为附加字段返回。
+
+## D-0012：Phase 1 不生成或提交伪 production statistics
+
+- 日期：2026-08-15
+- 状态：Accepted
+- 决策：本阶段只运行每任务 1 episode 的 smoke statistics，文件留在 `/tmp` 且不能由默认 processor 加载。
+- 理由：本机持久数据根缺 `click_mouse` 和 `pinch_tongs`；为 shape/video smoke 下载的官方 `file-000` 只覆盖最少文件，不等于完整持久训练集。
+- 后续条件：补齐六任务后，使用无 `--max-episodes-per-task` 的正式命令生成训练输出目录中的 `dataset_stats.json`。
